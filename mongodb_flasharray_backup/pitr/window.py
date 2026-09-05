@@ -90,11 +90,19 @@ def covers(windowed: list[tuple[int, int, str]], target: int) -> bool:
 
 
 def floors_from_tag(tag_value: Optional[str]) -> dict[str, tuple[int, int]]:
-    """{shardId: (t, i)} parsed from the mongo:floor tag JSON; {} when absent/unparseable."""
+    """Floors parsed from the mongo:floor tag JSON; {} when absent/unparseable.
+
+    Two formats: the compact cluster-wide form '{"t":..,"i":..,"shards":N}' (the MAX floor across
+    shards — written by the snapshot; scale-proof for FA tag value limits) is returned as
+    {"cluster-max": (t, i)}; the legacy per-shard form '{"<shard>":{"t":..,"i":..},...}' is returned
+    as {shardId: (t, i)}. The refusal decision is identical either way (target must be >= every
+    floor <=> target >= the max)."""
     if not tag_value:
         return {}
     try:
         raw = json.loads(tag_value)
+        if isinstance(raw, dict) and "t" in raw:
+            return {"cluster-max": (int(raw["t"]), int(raw.get("i", 0)))}
         out = {}
         for shard, ts in raw.items():
             out[str(shard)] = (int(ts["t"]), int(ts.get("i", 0)))

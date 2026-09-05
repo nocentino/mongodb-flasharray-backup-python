@@ -18,6 +18,7 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 new-mongo-snapshot            = "mongodb_flasharray_backup.snapshot:main"
+preflight-mongo-backup        = "mongodb_flasharray_backup.preflight:main"
 restore-mongo-snapshot        = "mongodb_flasharray_backup.restore:main"
 restore-mongo-snapshot-to-target = "mongodb_flasharray_backup.restore_to_target:main"
 initialize-protection-groups  = "mongodb_flasharray_backup.init_protection_groups:main"

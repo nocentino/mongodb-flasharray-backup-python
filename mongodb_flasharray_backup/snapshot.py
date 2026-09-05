@@ -102,6 +102,15 @@ def _run(
         "pause chunk migrations, so an in-flight migration can make the independently-taken per-shard "
         "snapshots mutually inconsistent. Default: stop the balancer, then restore its prior state.",
     ),
+    # --snapshotable-wait: bounded wait for TRANSIENT backup-view lag on "no snapshotable member".
+    snapshotable_wait: int = typer.Option(
+        0,
+        "--snapshotable-wait",
+        help="Seconds to poll when a shard has no snapshotable member and the diagnosis is TRANSIENT "
+        "backup-view lag (members fresh in monitoring, stale in the backup view — typical right after "
+        "a restore/shard add; it self-heals). 0 = fail fast. A STRUCTURAL cause (agent down, host "
+        "missing from the views) always fails fast regardless.",
+    ),
 ) -> None:
     # Load .env FIRST (raises if missing) so all configuration is available before any work begins.
     config.load_config(deployment=deployment)
@@ -188,11 +197,44 @@ def _run(
                 )
                 ExistingJob = None
             if ExistingJob and ExistingJob.get("state") in ActiveStates:
-                raise RuntimeError(
-                    f"OM snapshot job '{PrevSnapshotId}' is already in progress "
-                    f"(state={ExistingJob.get('state')}). Wait for it to finish or call /fail to release "
-                    "the cursor before starting a new snapshot."
-                )
+                PrevState = ExistingJob.get("state")
+                if PrevState == "READY":
+                    # A previous interrupted run left its job READY: the backup cursor is open but that
+                    # run's FA snapshot never completed the workflow, so nothing references the OM
+                    # record. READY is safely finishable — /finish just releases the cursor — and
+                    # leaving it makes OM reject every new snapshot with a bare 400. Clear it.
+                    config.write_host(
+                        f"  Found a READY in-flight job {PrevSnapshotId} from a previous run — "
+                        "/finish-ing it to release its backup cursor so this run can proceed...",
+                        fg=config.YELLOW,
+                    )
+                    try:
+                        config.invoke_om_api_with_retry(
+                            method="POST",
+                            path=f"group/{cfg.GroupId}/clusters/{cfg.ClusterId}/snapshot/{PrevSnapshotId}/finish",
+                        )
+                        config.wait_om_snapshot_state(
+                            PrevSnapshotId, "FINISHED", timeout_minutes=5, poll_interval_sec=3
+                        )
+                        config.write_host("  In-flight job cleared (FINISHED).", fg=config.GREEN)
+                    except Exception as e:  # noqa: BLE001
+                        raise RuntimeError(
+                            f"Could not clear the READY in-flight job {PrevSnapshotId} ({e}). "
+                            "Clear it manually (POST .../snapshot/{id}/finish) before retrying."
+                        )
+                elif PrevState == "PENDING":
+                    raise RuntimeError(
+                        f"OM snapshot job '{PrevSnapshotId}' is PENDING. Do NOT /fail a PENDING "
+                        "third-party job (it can wedge OM's backup subsystem, and /fail is a no-op on "
+                        "a stuck one). A PENDING job usually means OM could not open the backup cursor "
+                        "(e.g. a not-snapshotable shard); OM reclaims it at the job timeout — fix the "
+                        "cause, wait for the reclaim, then retry."
+                    )
+                else:
+                    raise RuntimeError(
+                        f"OM snapshot job '{PrevSnapshotId}' is already in progress "
+                        f"(state={PrevState}). Wait for it to finish/clear before starting a new snapshot."
+                    )
             if ExistingJob:
                 config.write_host(
                     f"  OM snapshot check: no active job (last={PrevSnapshotId}, "
@@ -284,30 +326,127 @@ def _run(
                 )
             return st == "active"
 
-        for RS in replica_sets:
-            # Snapshotable candidates whose automation agent is confirmed running.
-            # Open the backup cursor on the PRIMARY (highest-optime member) so the cursor-pinned, consistent
-            # snapshot is the freshest point in the RS. Fall back to a secondary only if the primary is not
-            # snapshotable/agent-reachable. NOTE: pinning the checkpoint on the primary adds backup-window
-            # overhead (checkpoint retention + journal growth) to the write-serving node — an accepted trade.
-            Candidates = [
-                n for n in (RS.get("nodes") or [])
-                if n.get("snapshotable") is True and _agent_active(n)
-            ]
-            Chosen = next((n for n in Candidates if n.get("memberState") == "PRIMARY"), None)
-            if not Chosen:
-                Chosen = next((n for n in Candidates if n.get("memberState") == "SECONDARY"), None)
-            if not Chosen:
-                Chosen = Candidates[0] if Candidates else None  # any agent-reachable snapshotable member
-            if not Chosen:
-                raise RuntimeError(
-                    f"No snapshotable node with a reachable automation agent for replica set "
-                    f"{RS.get('id')}. Refusing to open a backup cursor on a host whose agent is down "
-                    "(the snapshot job would stall). Restart the agent or wait for a healthy primary."
+        def _select_nodes(detail: dict) -> tuple[list[str], list[dict]]:
+            """One selection pass. Returns (chosen node ids, replica sets with NO usable member).
+            Open the backup cursor on the PRIMARY (highest-optime member) so the cursor-pinned,
+            consistent snapshot is the freshest point in the RS; fall back to a secondary only when the
+            primary is not snapshotable/agent-reachable. NOTE: pinning the checkpoint on the primary
+            adds backup-window overhead (checkpoint retention + journal growth) — an accepted trade."""
+            node_ids: list[str] = []
+            failing: list[dict] = []
+            for RS in detail.get("replicaSets") or []:
+                Candidates = [
+                    n for n in (RS.get("nodes") or [])
+                    if n.get("snapshotable") is True and _agent_active(n)
+                ]
+                Chosen = next((n for n in Candidates if n.get("memberState") == "PRIMARY"), None)
+                if not Chosen:
+                    Chosen = next((n for n in Candidates if n.get("memberState") == "SECONDARY"), None)
+                if not Chosen:
+                    Chosen = Candidates[0] if Candidates else None  # any agent-reachable snapshotable member
+                if not Chosen:
+                    failing.append(RS)
+                    continue
+                node_ids.append(Chosen.get("id"))
+                config.write_host(
+                    f"  {RS.get('id')} -> {Chosen.get('id')} [{Chosen.get('memberState')}] (agent active)",
+                    fg=config.CYAN,
                 )
-            NodeIds.append(Chosen.get("id"))
-            config.write_host(
-                f"  {RS.get('id')} -> {Chosen.get('id')} [{Chosen.get('memberState')}] (agent active)", fg=config.CYAN
+            return node_ids, failing
+
+        def _monitoring_freshness() -> dict:
+            """host:port -> seconds since the MONITORING view's lastPing (public API). The backup view
+            (snapshotable/lastAgentPing) lags the monitoring view after restores/topology changes; a
+            member fresh in monitoring but stale in backup is a TRANSIENT condition that self-heals."""
+            try:
+                res = config.invoke_om_api(
+                    path=f"groups/{cfg.GroupId}/hosts?itemsPerPage=500", path_prefix=""
+                )
+                out = {}
+                now_utc = datetime.now(timezone.utc)
+                for h in res.get("results") or []:
+                    lp = h.get("lastPing")
+                    if not lp:
+                        continue
+                    try:
+                        ts = datetime.fromisoformat(str(lp).replace("Z", "+00:00"))
+                        out[f"{h.get('hostname')}:{h.get('port')}"] = (now_utc - ts).total_seconds()
+                    except Exception:  # noqa: BLE001
+                        continue
+                return out
+            except Exception as e:  # noqa: BLE001
+                config.write_host(f"    (monitoring cross-check unavailable: {e})", fg=config.DARK_GRAY)
+                return {}
+
+        # Selection with snapshotability diagnosis: on "no snapshotable member", dump each member's
+        # backup-view state, cross-check the monitoring view, and issue a verdict — TRANSIENT backup-
+        # view lag (self-heals; optionally wait with --snapshotable-wait) vs STRUCTURAL (agent down /
+        # host missing from the views / backup not started — waiting will never fix it: fail fast).
+        SelectDeadline = time.time() + max(0, snapshotable_wait)
+        while True:
+            _agent_state.clear()  # re-probe agents on each pass (an agent may have just come back)
+            NodeIds, FailingRs = _select_nodes(ClusterDetail)
+            if not FailingRs:
+                break
+            freshness = _monitoring_freshness()
+            all_transient = True
+            verdict_lines: list[str] = []
+            for RS in FailingRs:
+                members = [n for n in (RS.get("nodes") or [])]
+                config.write_host(
+                    f"  {RS.get('id')}: NO snapshotable member — backup-view state:", fg=config.RED
+                )
+                for n in members:
+                    config.write_host(
+                        f"      {n.get('id')}  state={n.get('memberState')}  "
+                        f"snapshotable={n.get('snapshotable')}  hidden={n.get('hidden')}  "
+                        f"lastAgentPing={n.get('lastAgentPing')}",
+                        fg=config.YELLOW,
+                    )
+                fresh_members = [
+                    n.get("id") for n in members if freshness.get(n.get("id"), 1e9) < 120
+                ]
+                agent_alive = any(
+                    _agent_state.get((n.get("id") or "").split(":")[0]) == "active" for n in members
+                )
+                transient = bool(fresh_members) and agent_alive
+                all_transient = all_transient and transient
+                if transient:
+                    verdict_lines.append(
+                        f"    {RS.get('id')}: TRANSIENT backup-view lag — {len(fresh_members)} member(s) "
+                        "fresh in monitoring + agent active, but the backup view hasn't caught up "
+                        "(typical after a restore/shard add; self-heals)."
+                    )
+                else:
+                    verdict_lines.append(
+                        f"    {RS.get('id')}: STRUCTURAL — members stale/missing in the monitoring view "
+                        "or no reachable agent. Waiting will not fix this: check the agent "
+                        "(systemctl status mongodb-mms-automation-agent), the host's presence in "
+                        "automationConfig backupVersions/monitoringVersions, and that third-party "
+                        "backup is STARTED for this cluster (POST .../manage)."
+                    )
+            for line in verdict_lines:
+                config.write_host(line, fg=config.YELLOW if all_transient else config.RED)
+            if all_transient and time.time() < SelectDeadline:
+                remaining = int(SelectDeadline - time.time())
+                config.write_host(
+                    f"  Verdict TRANSIENT on every failing shard — waiting for the backup view to catch "
+                    f"up ({remaining}s left; poll every 15s)...",
+                    fg=config.CYAN,
+                )
+                time.sleep(15)
+                ClusterDetail = config.invoke_om_api(
+                    path=f"group/{cfg.GroupId}/clusters/{cfg.ClusterId}"
+                )
+                continue
+            raise RuntimeError(
+                f"{len(FailingRs)} replica set(s) have no snapshotable member with a reachable agent "
+                "(diagnostics + verdicts above). "
+                + (
+                    "All causes look TRANSIENT — re-run with --snapshotable-wait <sec> to wait it out."
+                    if all_transient
+                    else "At least one cause is STRUCTURAL — fix it before retrying (waiting won't help)."
+                )
             )
 
         config.write_host(f"Selected {len(NodeIds)} nodes for snapshot.", fg=config.GREEN)
@@ -681,11 +820,15 @@ def _run(
                 TagKeys.append("mongo:t1ts")
                 TagValues.append(str(OmSnapshotMetadata.get("snapshotTimestamp", {}).get("time")))
             if PitrFloor:
-                # Per-shard PITR floor (t/i only - node/port are runtime detail, not restore metadata).
+                # PITR floor, compact cluster-wide form: the MAX oplog head across shards. The replay
+                # guard's decision is "target must be >= EVERY shard's floor", which is exactly
+                # "target >= max(floors)" — identical semantics, and it stays within FA tag value
+                # limits at any shard count (a per-shard JSON blows past them at ~30+ shards).
+                _fl = max((int(a["t"]), int(a["i"])) for a in PitrFloor.values())
                 TagKeys.append("mongo:floor")
                 TagValues.append(
                     json.dumps(
-                        {sid: {"t": a["t"], "i": a["i"]} for sid, a in PitrFloor.items()},
+                        {"t": _fl[0], "i": _fl[1], "shards": len(PitrFloor)},
                         separators=(",", ":"),
                     )
                 )

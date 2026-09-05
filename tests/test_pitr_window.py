@@ -91,10 +91,15 @@ def test_covers():
 # --------------------------------------------------------------------------------------------------------
 
 def test_floors_from_tag():
+    # Legacy per-shard form.
     tag = '{"aen-shard_1":{"t":1784831329,"i":5},"config":{"t":1784831330}}'
     assert window.floors_from_tag(tag) == {
         "aen-shard_1": (1784831329, 5),
         "config": (1784831330, 0),
+    }
+    # Compact cluster-wide max form (what the snapshot writes; scale-proof for FA tag limits).
+    assert window.floors_from_tag('{"t":1784831330,"i":2,"shards":33}') == {
+        "cluster-max": (1784831330, 2)
     }
     assert window.floors_from_tag(None) == {}
     assert window.floors_from_tag("") == {}

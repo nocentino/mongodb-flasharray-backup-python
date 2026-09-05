@@ -297,6 +297,27 @@ def _run(
 
         # endregion
 
+        def _bundle_copy(host: str, remote_files: list, seg_dir_path) -> bool:
+            """Copy a cycle's slice files as ONE tar stream instead of one scp per file. Per-file scp
+            scales with file COUNT, not bytes (~2 files/s incl. SSH handshakes) — a backlog drain
+            crawls and trips SSH rate limits (the exit-255 storms). The remote GNU tar flattens paths
+            to basenames (--transform), which are unique per RS (<start>_<end>.oplogs), and extracts
+            straight into the segments dir. Returns False on ANY failure — the caller falls back to
+            the per-file scp path (with its member fallback), so this is purely an optimization."""
+            import shlex
+
+            quoted = " ".join(shlex.quote(f) for f in remote_files)
+            ssh_opts = " ".join(config.SSH_OPTS)
+            pipeline = (
+                f"ssh {ssh_opts} {shlex.quote(ssh_user)}@{shlex.quote(host)} "
+                f"\"tar -cf - -P --transform 's|.*/||' {quoted}\" "
+                f"| tar -xf - -C {shlex.quote(str(seg_dir_path))}"
+            )
+            proc = subprocess.run(
+                ["bash", "-o", "pipefail", "-c", pipeline], capture_output=True, text=True
+            )
+            return proc.returncode == 0
+
         # Loop until the stop sentinel appears.
         while not stop_file.exists():
             iter_start = datetime.now()
@@ -401,7 +422,25 @@ def _run(
                         seg_dir.mkdir(parents=True, exist_ok=True)
 
                         log_files = range_node.get("logFiles") or []
-                        for remote_file in log_files:
+                        # Bundle multi-file cycles (backlog drains) as one tar stream; single-file
+                        # steady-state cycles keep the plain scp. Any bundle failure falls back to
+                        # the per-file path below (which also carries the stepdown member fallback).
+                        bundled = False
+                        if len(log_files) >= 3:
+                            bundled = _bundle_copy(node_host, log_files, seg_dir)
+                            if bundled:
+                                config.write_host(
+                                    f"  [{_now_hms()}]  {shard_key}: bundled {len(log_files)} file(s) "
+                                    f"from {node_host} in one tar stream",
+                                    fg=config.CYAN,
+                                )
+                            else:
+                                config.write_host(
+                                    f"  [{_now_hms()}]  WARNING: tar bundle from {node_host} failed — "
+                                    "falling back to per-file scp",
+                                    fg=config.YELLOW,
+                                )
+                        for remote_file in ([] if bundled else log_files):
                             # Store each segment under its original OM filename so on-disk
                             # lexical order matches chronological order during replay.
                             local_name = os.path.basename(remote_file)

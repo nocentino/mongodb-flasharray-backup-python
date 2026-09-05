@@ -106,6 +106,12 @@ def _run(
         help="UNSAFE: replay to a target below the snapshot's recorded on-disk floor (mongo:floor). "
         "The result will contain MORE data than the target implies (an undone drop can come back).",
     ),
+    replay_timeout_sec: int = typer.Option(
+        3600,
+        "--replay-timeout-sec",
+        help="Per-segment timeout for the remote mongorestore --oplogReplay. Under heavy write load a "
+        "segment can take minutes; raise for very large recovery windows.",
+    ),
     deployment: str = typer.Option(
         None,
         "--deployment",
@@ -478,16 +484,29 @@ EC=$?
 rm -rf $TMPDIR {remote_file}
 exit $EC
 """
-            replay_proc = subprocess.run(
-                [
-                    "ssh",
-                    *config.SSH_OPTS,
-                    f"{config.CFG.SshUser}@{unit['Node']}",
-                    replay_cmd,
-                ],
-                capture_output=True,
-                text=True,
-            )
+            try:
+                replay_proc = subprocess.run(
+                    [
+                        "ssh",
+                        *config.SSH_OPTS,
+                        f"{config.CFG.SshUser}@{unit['Node']}",
+                        replay_cmd,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=replay_timeout_sec,
+                )
+            except subprocess.TimeoutExpired:
+                # Honest timeout: killing the local ssh does NOT kill the remote mongorestore — it is
+                # very likely STILL APPLYING on the node. Stop here (later segments must not apply over
+                # an unknown state) and say exactly that.
+                errors.append(
+                    f"{unit['ShardId']}/{unit['SegLabel']}: mongorestore exceeded "
+                    f"--replay-timeout-sec={replay_timeout_sec} on {unit['Node']}. The REMOTE "
+                    "mongorestore was NOT killed and may still be applying — verify it finished "
+                    "(pgrep mongorestore on the node) before re-running; later segments were NOT replayed."
+                )
+                break
             restore_exit = replay_proc.returncode
             # Merge stderr into the captured output stream.
             out = (replay_proc.stdout or "") + (replay_proc.stderr or "")
