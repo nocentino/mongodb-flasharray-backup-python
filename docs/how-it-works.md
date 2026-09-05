@@ -316,6 +316,28 @@ The key invariant is where the per-shard oplog anchor is captured: **after the F
 
 Each tailer segment uses disjoint bounds (`{ ts: { $gt: lastTs, $lte: readTs } }`) so segments contain no duplicates and no gaps. Segments are named `oplog-NNNNNNNN-<t>-<i>.bson` so lexical sort equals capture order. `invoke-oplog-replay` applies them per-shard via `mongorestore --oplogReplay`; `--oplogLimit` trims the final segment to an exact `TargetTimestamp` for sub-segment precision.
 
+### The PITR floor, window validation, and the pre-restore gate
+
+Three guards protect a point-in-time recovery (all implemented in `pitr/window.py`):
+
+- **The floor (`mongo:floor` tag).** A PIT target can only roll **forward** from the volume snapshot's
+  **on-disk state (~snapshot creation)** — not from the earlier backup-cursor anchor. The snapshot records
+  each shard's oplog head **right after the FA snapshot fires** (so it's ≥ the true on-disk state), and
+  `invoke-oplog-replay` **refuses a target below any shard's floor**: a target in the `[anchor, floor)`
+  "dead zone" is unreachable, and replaying to it would silently leave MORE data than requested (an undone
+  drop can come back) while reporting success. `--allow-floor-override` bypasses (unsafe); a pre-floor
+  snapshot (no tag) warns.
+- **All-or-nothing window validation.** Before replaying *any* shard, every shard's `(T1, target]` window
+  is validated: no hole between the anchor and the first captured segment, no interior hole (a stepdown or
+  a lost file can split the stream), and the window **reaches the target**. Failing one shard mid-run would
+  otherwise leave shards at *different* points in time. Gap markers and holes are **scoped to the window**
+  — a gap past the target never blocks a valid restore. On a mid-replay segment failure the replay **stops
+  at that segment** (later segments must not apply over a missing window); oplog application is idempotent,
+  so fixing the cause and re-running is safe.
+- **The pre-restore gate (`restore-mongo-snapshot --pitr-target <ts|0>`).** When a restore is the first
+  half of a PITR, pass the intended target and the same validation runs **before anything is overwritten**
+  — discovering an unreachable target *after* the volumes are reverted is too late.
+
 ---
 
 ## Backup Data Location

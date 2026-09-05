@@ -91,6 +91,9 @@ def _run(
     # Load config first.
     config.load_config(deployment=deployment)
 
+    # SIGTERM must run the same cleanup as Ctrl-C (/fail the in-flight oplog job, write final state).
+    config.install_sigterm_handler()
+
     # Read env-derived values used in this script
     group_id = config.CFG.GroupId
     cluster_id = config.CFG.ClusterId
@@ -192,7 +195,14 @@ def _run(
             return st == "active"
 
         tailing_node_ids: list[str] = []
+        # Member hosts per replica set — the scp fallback pool. If a slice file is missing on the node
+        # OM listed (a primary stepdown mid-window can move the slicing node), the other members are
+        # probed for the same path before the job is failed.
+        members_by_rs: dict[str, list[str]] = {}
         for rs in (cluster_detail.get("replicaSets") or []):
+            members_by_rs[rs.get("id")] = [
+                (n.get("id") or "").split(":")[0] for n in (rs.get("nodes") or []) if n.get("id")
+            ]
             # Snapshotable candidates whose automation agent is confirmed running.
             candidates = [
                 n for n in (rs.get("nodes") or [])
@@ -411,9 +421,40 @@ def _run(
                                 text=True,
                             )
                             if proc.returncode != 0:
-                                raise RuntimeError(
-                                    f"scp failed for {remote_file} from {node_host} (exit {proc.returncode})"
-                                )
+                                # Stepdown resilience: a primary stepdown mid-window can move the
+                                # slicing node, leaving this file on a DIFFERENT member than the one
+                                # OM listed (or the listed node just died). Probe the RS's other
+                                # members for the same path before failing the job — a single-node
+                                # read here would otherwise silently under-capture the window.
+                                recovered_from = None
+                                for alt_host in members_by_rs.get(rs_id, []):
+                                    if alt_host == node_host:
+                                        continue
+                                    alt = subprocess.run(
+                                        [
+                                            "scp",
+                                            *config.SSH_OPTS,
+                                            f"{ssh_user}@{alt_host}:{remote_file}",
+                                            str(local_path),
+                                        ],
+                                        capture_output=True,
+                                        text=True,
+                                    )
+                                    if alt.returncode == 0:
+                                        recovered_from = alt_host
+                                        break
+                                if recovered_from:
+                                    config.write_host(
+                                        f"  [{_now_hms()}]  WARNING: {local_name} was not on "
+                                        f"{node_host} (exit {proc.returncode}) — recovered from "
+                                        f"{recovered_from} (slicing node moved, e.g. a stepdown).",
+                                        fg=config.YELLOW,
+                                    )
+                                else:
+                                    raise RuntimeError(
+                                        f"scp failed for {remote_file} from {node_host} "
+                                        f"(exit {proc.returncode}) and no other {rs_id} member has it"
+                                    )
                         config.write_host(
                             f"  [{_now_hms()}]  {shard_key}: {len(log_files)} file(s)  "
                             f"end={int(range_end['time'])}:{int(range_end['inc'])}",

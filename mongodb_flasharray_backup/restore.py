@@ -41,6 +41,7 @@ from __future__ import annotations
 # Configuration is loaded via `from . import config` + config.load_config() called
 # as the FIRST statement of the worker (_run).
 
+import json
 import logging
 import os
 import re
@@ -52,6 +53,7 @@ from pathlib import Path
 import typer
 
 from . import config
+from .pitr import window as pitr_window
 
 # FlashArray access is via the direct-REST client (config.connect_fa / fa_rest.py).
 
@@ -113,6 +115,14 @@ def _run(
         "--skip-verification",
         help="skip STEP 8 entirely; otherwise STEP 8 is fail-hard on unparseable counts",
     ),
+    # --pitr-target: when this restore is the first half of a PITR, verify the captured oplog stream
+    # can actually reach the target BEFORE any destructive step. -1 (default) = not a PITR, no check.
+    pitr_target: int = typer.Option(
+        -1,
+        "--pitr-target",
+        help="If you will replay oplog after this restore, pass the PIT target here (0 = replay-all) "
+        "to verify the captured stream reaches it BEFORE anything is overwritten. -1 disables.",
+    ),
     deployment: str = typer.Option(
         None,
         "--deployment",
@@ -122,6 +132,9 @@ def _run(
     # Load configuration. Must be FIRST so running without
     # .env throws (but --help still works because typer short-circuits before this).
     config.load_config(deployment=deployment)
+
+    # SIGTERM must run the same finally-cleanup as Ctrl-C (restart agents on abort, release the lock).
+    config.install_sigterm_handler()
 
     # region --- Configuration ---
     wait_timeout_sec = 600   # Max seconds to wait for cluster to stabilize
@@ -188,6 +201,62 @@ def _run(
             fa_context_names = config.resolve_fa_context_names(fa, config.CFG.ProtectionGroupName)
             snap_name = f"{config.CFG.ProtectionGroupName}.{snapshot_tag}"
             snap_tags = config.get_fa_snapshot_tags(fa, fa_context_names, snap_name)
+
+            # Optional PITR gate (--pitr-target >= 0): when this restore will be followed by an oplog
+            # replay, verify the captured stream can actually reach the target BEFORE anything is
+            # overwritten — discovering an unreachable target after the volumes are reverted is too
+            # late. Validates: below-floor target (mongo:floor), gap markers intersecting the window,
+            # and per-shard window completeness (anchor hole / interior hole / reaches the target).
+            if pitr_target >= 0:
+                config.write_host(
+                    f"  PITR gate: verifying the captured oplog stream reaches target "
+                    f"{'(replay-all)' if pitr_target == 0 else pitr_target} ...",
+                    fg=config.CYAN,
+                )
+                stream_dir = Path(os.path.expanduser("~")) / "mongo-oplog-stream" / snapshot_tag
+                gate_problems: list[str] = []
+                t1_gate = int(snap_tags.get("mongo:t1ts") or 0)
+                floors = pitr_window.floors_from_tag(snap_tags.get("mongo:floor"))
+                if pitr_target > 0:
+                    for shard, fl in sorted(pitr_window.floor_violations(floors, pitr_target).items()):
+                        gate_problems.append(
+                            f"{shard}: target {pitr_target} is BELOW the snapshot's on-disk floor "
+                            f"{fl[0]}:{fl[1]} — unreachable (replay only rolls forward)"
+                        )
+                if not stream_dir.exists():
+                    gate_problems.append(
+                        f"no captured oplog stream at {stream_dir} — run start-oplog-tailer with this tag"
+                    )
+                else:
+                    for g in sorted(stream_dir.glob("gap-*.json")):
+                        try:
+                            gd = json.loads(g.read_text())
+                        except Exception:  # noqa: BLE001
+                            gd = {}
+                        if pitr_window.gap_is_relevant(gd, t1_gate, pitr_target):
+                            gate_problems.append(f"gap marker {g.name} intersects the replay window")
+                    shard_dirs = [
+                        d for d in sorted(stream_dir.iterdir())
+                        if d.is_dir() and (d / "segments").exists()
+                    ]
+                    if not shard_dirs:
+                        gate_problems.append(f"no per-shard segment dirs under {stream_dir}")
+                    for d in shard_dirs:
+                        segs = pitr_window.list_segments(d / "segments")
+                        gate_problems.extend(
+                            pitr_window.validate_shard_window(d.name, segs, t1_gate, pitr_target)
+                        )
+                if gate_problems:
+                    joined = "\n".join(f"    {p}" for p in gate_problems)
+                    raise RuntimeError(
+                        f"PITR gate failed — the intended point-in-time is NOT reachable from the "
+                        f"captured oplog stream:\n{joined}\n  Nothing has been overwritten; the cluster "
+                        "is untouched. Fix the stream (drain the tailer / pick a reachable target) and "
+                        "re-run, or omit --pitr-target for a plain snapshot restore."
+                    )
+                config.write_host(
+                    "  PITR gate: captured stream is complete and reaches the target.", fg=config.GREEN
+                )
 
             # mongo:volumes records the volume names that were part of this snapshot.
             if snap_tags.get("mongo:volumes"):

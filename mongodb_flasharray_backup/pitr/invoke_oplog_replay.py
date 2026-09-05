@@ -26,6 +26,7 @@ from pathlib import Path
 import typer
 
 from .. import config
+from . import window
 
 
 # ------------------------------------------------------------------------------------------------
@@ -96,7 +97,14 @@ def _run(
     allow_gaps: bool = typer.Option(
         False,
         "--allow-gaps",
-        help="proceed even if oplog gap markers are present (PIT coverage in the gap window is unrecoverable)",
+        help="proceed even if the replay window has gap markers or missing/short coverage "
+        "(PIT coverage across a gap is unrecoverable; only data up to the first gap is trustworthy)",
+    ),
+    allow_floor_override: bool = typer.Option(
+        False,
+        "--allow-floor-override",
+        help="UNSAFE: replay to a target below the snapshot's recorded on-disk floor (mongo:floor). "
+        "The result will contain MORE data than the target implies (an undone drop can come back).",
     ),
     deployment: str = typer.Option(
         None,
@@ -106,6 +114,9 @@ def _run(
 ):
     # Load config FIRST (throws without .env).
     config.load_config(deployment=deployment)
+
+    # SIGTERM must behave like Ctrl-C so an interrupted replay reports honestly instead of dying cold.
+    config.install_sigterm_handler()
 
     # Log dir + log file appended to during this run.
     log_dir = Path(os.path.expanduser("~")) / "mongo-oplogreplay-logs"
@@ -126,29 +137,9 @@ def _run(
                 f"Oplog stream directory not found at {oplog_dir}. Run start-oplog-tailer first."
             )
 
-        # Gap pre-check (validate no oplog gaps before a PIT restore): the tailer writes a
-        # gap-<timestamp>.json marker whenever oplog continuity (previousEnd) breaks. PIT coverage across
-        # such a window is unrecoverable, so refuse to replay unless explicitly overridden.
-        gap_files = sorted(oplog_dir.glob("gap-*.json"))
-        if gap_files:
-            details = []
-            for g in gap_files:
-                try:
-                    gd = json.loads(g.read_text())
-                    details.append(
-                        f"    {g.name}: storedLastEnd={gd.get('storedLastEnd')} omPreviousEnd={gd.get('omPreviousEnd')}"
-                    )
-                except Exception:  # noqa: BLE001
-                    details.append(f"    {g.name}")
-            msg = (
-                f"{len(gap_files)} oplog gap marker(s) present in {oplog_dir} — PIT coverage is incomplete; "
-                "replay to a point inside/after a gap is unrecoverable:\n" + "\n".join(details)
-            )
-            if not allow_gaps:
-                raise RuntimeError(
-                    msg + "\n  Re-run with --allow-gaps to replay anyway (only data up to the first gap is trustworthy)."
-                )
-            config.write_host(f"  WARNING: {msg}\n  Proceeding due to --allow-gaps.", fg=config.YELLOW)
+        # NOTE: gap markers are checked further below, once T1 (mongo:t1ts) is known — so a gap that
+        # sits entirely OUTSIDE the (T1, target] replay window (already inside the snapshot, or past
+        # the target) never blocks a valid restore.
 
         # Header + replay target description.
         config.write_host(f"\n=== Oplog Replay for snapshot {snapshot_tag} ===", fg=config.YELLOW)
@@ -262,8 +253,86 @@ def _run(
                 fg=config.YELLOW,
             )
 
-        # Build the per-shard work list (a flat list of work units).
+        # --- PITR floor guard: a PIT target below the snapshot's on-disk state is unreachable. ---
+        # The volume snapshot restores to ~its creation instant (the per-shard mongo:floor tag, read
+        # right after the FA snapshot fired) and replay only rolls FORWARD — so a target in the
+        # [anchor, floor) dead zone would silently leave MORE data than requested and report success
+        # (an undone drop can come back). Refuse it before touching anything.
+        floors = window.floors_from_tag(snap_tags.get("mongo:floor"))
+        if target_timestamp > 0:
+            if floors:
+                violations = window.floor_violations(floors, target_timestamp)
+                if violations:
+                    lines = "\n".join(
+                        f"    {shard}: floor={fl[0]}:{fl[1]} "
+                        f"({datetime.fromtimestamp(fl[0], tz=timezone.utc).isoformat().replace('+00:00', 'Z')})"
+                        for shard, fl in sorted(violations.items())
+                    )
+                    msg = (
+                        f"PIT target {target_timestamp} is BELOW the snapshot's on-disk floor for "
+                        f"{len(violations)} shard(s):\n{lines}\n  A restore lands at the snapshot's "
+                        "on-disk state and replay only rolls forward — this target cannot be reached; "
+                        "the cluster would silently hold MORE data than the target implies. Use an "
+                        "EARLIER snapshot whose floor is at/below the target, or raise the target."
+                    )
+                    if not allow_floor_override:
+                        raise RuntimeError(
+                            msg + "\n  (--allow-floor-override replays anyway — unsafe.)"
+                        )
+                    config.write_host(
+                        f"  WARNING: {msg}\n  Proceeding due to --allow-floor-override.",
+                        fg=config.YELLOW,
+                    )
+                else:
+                    config.write_host(
+                        f"  Floor check: target {target_timestamp} is at/above every shard's on-disk floor.",
+                        fg=config.GREEN,
+                    )
+            else:
+                config.write_host(
+                    "  WARNING: mongo:floor tag absent (pre-floor snapshot) — cannot verify the target "
+                    "sits at/above the snapshot's on-disk state; a below-floor target silently "
+                    "over-restores.",
+                    fg=config.YELLOW,
+                )
+
+        # --- Gap markers, scoped to the (T1, target] replay window. ---
+        # The tailer writes gap-<ts>.json whenever oplog continuity (previousEnd) breaks. Only a gap
+        # intersecting the window being replayed makes the PIT unrecoverable; one already inside the
+        # snapshot (at/before T1) or beyond the target is irrelevant.
+        gap_files = sorted(oplog_dir.glob("gap-*.json"))
+        relevant_gaps: list[str] = []
+        for g in gap_files:
+            try:
+                gd = json.loads(g.read_text())
+            except Exception:  # noqa: BLE001 - unreadable marker: treat as relevant (conservative)
+                gd = {}
+            if window.gap_is_relevant(gd, t1_at_cluster_time, target_timestamp):
+                relevant_gaps.append(
+                    f"    {g.name}: storedLastEnd={gd.get('storedLastEnd')} omPreviousEnd={gd.get('omPreviousEnd')}"
+                )
+        if gap_files and not relevant_gaps:
+            config.write_host(
+                f"  {len(gap_files)} gap marker(s) present but none intersect the replay window — ignored.",
+                fg=config.DARK_GRAY,
+            )
+        if relevant_gaps:
+            msg = (
+                f"{len(relevant_gaps)} oplog gap marker(s) intersect the replay window — PIT coverage is "
+                "incomplete; replay to a point inside/after a gap is unrecoverable:\n"
+                + "\n".join(relevant_gaps)
+            )
+            if not allow_gaps:
+                raise RuntimeError(
+                    msg
+                    + "\n  Re-run with --allow-gaps to replay anyway (only data up to the first gap is trustworthy)."
+                )
+            config.write_host(f"  WARNING: {msg}\n  Proceeding due to --allow-gaps.", fg=config.YELLOW)
+
+        # Build the per-shard work list (a flat list of work units) + per-shard segment inventories
+        # for the pre-replay window validation below.
         plan: list[dict] = []
+        problems: list[str] = []
         for s in shards:
             shard_id = s["shardId"]
             # Segments are written under the canonical shard id. Older streams (and the tailer's
@@ -274,45 +343,60 @@ def _run(
             seg_dir = oplog_dir / shard_id / "segments"
             if not seg_dir.exists() and rs_id and (oplog_dir / rs_id / "segments").exists():
                 seg_dir = oplog_dir / rs_id / "segments"
-            if not seg_dir.exists():
-                config.write_host(
-                    f"  WARNING: no segments dir for {shard_id} (looked in {shard_id}/ and {rs_id}/) - skipping shard",
-                    fg=config.YELLOW,
-                )
+            segments = window.list_segments(seg_dir)
+            if not segments:
+                # No captured stream for this shard at all. For a bounded PIT target that is a
+                # coverage failure (the target provably can't be reached on this shard); for a
+                # replay-all it stays a warn-and-skip (a shard with nothing to replay is a no-op).
+                if target_timestamp > 0:
+                    problems.append(
+                        f"{shard_id}: no captured segments (looked in {shard_id}/ and {rs_id}/) — the "
+                        f"target {target_timestamp} cannot be reached on this shard"
+                    )
+                else:
+                    config.write_host(
+                        f"  WARNING: no segments found for {shard_id} (looked in {shard_id}/ and {rs_id}/) - skipping shard",
+                        fg=config.YELLOW,
+                    )
                 continue
-            # *.oplogs segment files, sorted by name (lexical == chronological order).
-            files = sorted(
-                [f for f in seg_dir.iterdir() if f.is_file() and f.name.endswith(".oplogs")],
-                key=lambda f: f.name,
+            # Window-scoped completeness for this shard: anchor hole, interior hole, reach-the-target.
+            problems.extend(
+                window.validate_shard_window(shard_id, segments, t1_at_cluster_time, target_timestamp)
             )
-            if len(files) == 0:
-                config.write_host(
-                    f"  WARNING: no segments found for {shard_id} in {seg_dir} - skipping shard",
-                    fg=config.YELLOW,
-                )
-                continue
-            for f in files:
-                # Parse timestamps from the OM filename: <startTs>_<endTs>.oplogs
-                parts = f.stem.split("_")
-                start_ts = int(parts[0])
-                end_ts = int(parts[1])
-                # Skip segments entirely before or at the T1 snapshot atClusterTime.
-                if t1_at_cluster_time > 0 and end_ts <= t1_at_cluster_time:
-                    continue
-                # Skip files whose entire window is beyond the PIT target.
-                if target_timestamp > 0 and start_ts > target_timestamp:
-                    continue
+            for start_ts, end_ts, seg_name in window.window_segments(
+                segments, t1_at_cluster_time, target_timestamp
+            ):
                 plan.append(
                     {
                         "ShardId": shard_id,
                         "RsHosts": s["rsHosts"],
                         "Node": s["host"].split(":")[0],
-                        "LocalPath": str(f),
-                        "SegLabel": f.stem,
+                        "LocalPath": str(seg_dir / seg_name),
+                        "SegLabel": seg_name[: -len(".oplogs")],
                         "StartTs": start_ts,
                         "EndTs": end_ts,
                     }
                 )
+
+        # --- All-or-nothing gate: every shard's window must validate BEFORE any shard is replayed. ---
+        # Replaying shard-by-shard and discovering shard N's bad window mid-run would leave shards
+        # 1..N-1 already rolled forward — a silent cross-shard inconsistency. Refuse up front instead.
+        if problems:
+            joined = "\n".join(f"    {p}" for p in problems)
+            msg = (
+                f"pre-replay window validation failed for {len(problems)} issue(s):\n{joined}\n"
+                "  NO shard has been replayed; the cluster is still at the restore baseline."
+            )
+            if not allow_gaps:
+                raise RuntimeError(
+                    msg + "\n  Re-run with --allow-gaps to replay anyway (unsafe: coverage is incomplete)."
+                )
+            config.write_host(f"  WARNING: {msg}\n  Proceeding due to --allow-gaps.", fg=config.YELLOW)
+        elif plan:
+            config.write_host(
+                "  Pre-replay validation: every shard's window is contiguous and reaches the target.",
+                fg=config.GREEN,
+            )
 
         # Plan summary.
         if len(plan) == 0:
@@ -378,8 +462,11 @@ def _run(
                 text=True,
             )
             if proc.returncode != 0:
+                # Stop at the FIRST failure: continuing would apply this shard's LATER segments over a
+                # missing window — a silent hole in the applied history. Stopping keeps the state
+                # honest: shards/segments before this point are applied, nothing after it is.
                 errors.append(f"{unit['ShardId']}/{unit['SegLabel']}: scp to {unit['Node']} failed")
-                continue
+                break
 
             # Build the remote replay command.
             replay_cmd = f"""set +e
@@ -415,11 +502,18 @@ exit $EC
                     f"    seg {unit['SegLabel']}: mongorestore exit {restore_exit}",
                     fg=config.YELLOW,
                 )
+                # Stop at the FIRST failure (see the scp-failure note above): later segments must not
+                # apply over a missing window.
+                break
 
-        # Fail if any segment errored.
+        # Fail if a segment errored (the loop stopped there; nothing after it was applied).
         if len(errors) > 0:
             joined = "\n".join(errors)
-            raise RuntimeError(f"Oplog replay failed on {len(errors)} segment(s):\n{joined}")
+            raise RuntimeError(
+                f"Oplog replay stopped at the first failing segment:\n{joined}\n"
+                "  Segments before it are applied; nothing after it was touched. Fix the cause and "
+                "re-run the replay (oplog application is idempotent)."
+            )
 
         # Post-replay verification: count docs as a sanity check.
         config.write_host("\n=== Post-Replay Verification ===", fg=config.YELLOW)

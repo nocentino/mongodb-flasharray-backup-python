@@ -1101,3 +1101,20 @@ def resolve_node_volume_map(fa: Any, nodes: list[str], ssh_user_param: str, ssh_
 
 
 # endregion
+
+
+def install_sigterm_handler() -> None:
+    """Route SIGTERM through KeyboardInterrupt so finally-based cleanup (release the backup cursor,
+    re-enable the balancer, /fail an in-flight job) runs on `kill`/systemd-stop, not just Ctrl-C.
+    Python only executes finally blocks for signals that raise an exception; the default SIGTERM
+    disposition terminates the process cold, leaving cursors pinned and the balancer stopped."""
+    import signal
+
+    def _raise(_signum, _frame):
+        raise KeyboardInterrupt("SIGTERM")
+
+    try:
+        signal.signal(signal.SIGTERM, _raise)
+    except (ValueError, OSError):
+        # Not the main thread (or platform without signals) - keep the default disposition.
+        pass

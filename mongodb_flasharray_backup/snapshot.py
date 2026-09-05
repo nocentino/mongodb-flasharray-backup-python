@@ -107,6 +107,9 @@ def _run(
     config.load_config(deployment=deployment)
     cfg = config.CFG
 
+    # SIGTERM must run the same finally-cleanup as Ctrl-C (release the cursor, restore the balancer).
+    config.install_sigterm_handler()
+
     # region --- Configuration ---
     TimeoutMinutes = 150     # Max time for PENDING -> FINISHED
     PollIntervalSec = 3      # Seconds between GET polls
@@ -540,8 +543,8 @@ def _run(
                     return Anchors
                 except Exception as e:  # noqa: BLE001
                     config.write_host(
-                        f"  WARNING: oplog anchor capture failed - PITR tailer will not have a "
-                        f"snapshot-aligned start point. ({e})",
+                        f"  WARNING: PITR floor capture failed - the mongo:floor tag will be absent, so "
+                        f"replay cannot verify a PIT target sits at/above the snapshot's on-disk state. ({e})",
                         fg=config.YELLOW,
                     )
                     return None
@@ -629,6 +632,13 @@ def _run(
 
             # postSnap baseline - taken just after the FA snap and before /finish.
             PostSnapBaseline = get_collection_counts("postSnap")
+
+            # PITR floor - each shard's oplog head read AFTER the FA snapshot fired, so it is >= the
+            # snapshot's true on-disk state. A volume snapshot restores to that on-disk state and oplog
+            # replay only rolls FORWARD, so a PIT target below this floor is unreachable (it would
+            # silently return MORE data than requested). Written as the mongo:floor tag in STEP 7.5;
+            # invoke-oplog-replay refuses below-floor targets. Best-effort - never fails the snapshot.
+            PitrFloor = get_shard_oplog_anchors()
             # endregion
 
             # region --- STEP 6: Signal finish to Ops Manager (closes $backupCursor) ---
@@ -670,6 +680,15 @@ def _run(
             if OmSnapshotMetadata and OmSnapshotMetadata.get("snapshotTimestamp") is not None:
                 TagKeys.append("mongo:t1ts")
                 TagValues.append(str(OmSnapshotMetadata.get("snapshotTimestamp", {}).get("time")))
+            if PitrFloor:
+                # Per-shard PITR floor (t/i only - node/port are runtime detail, not restore metadata).
+                TagKeys.append("mongo:floor")
+                TagValues.append(
+                    json.dumps(
+                        {sid: {"t": a["t"], "i": a["i"]} for sid, a in PitrFloor.items()},
+                        separators=(",", ":"),
+                    )
+                )
 
             if len(TagKeys) > 0:
                 SnapName = f"{cfg.ProtectionGroupName}.{SnapshotTag}"
@@ -726,23 +745,49 @@ def _run(
             config.write_host(f"\n  ERROR: {sys.exc_info()[1]}", fg=config.RED)
             raise
         finally:
-            # finally runs on success, on thrown exceptions, AND on Ctrl-C / terminations.
+            # finally runs on success, on thrown exceptions, AND on Ctrl-C / SIGTERM.
             if SnapshotId and not SnapshotCompleted:
-                config.write_host(
-                    f"  Calling /fail to release backup cursor on {SnapshotId} ...", fg=config.YELLOW
-                )
+                # State-aware release: /fail a PENDING third-party snapshot job can wedge OM's backup
+                # subsystem (field incident), and OM treats /fail on a stuck PENDING job as a no-op
+                # anyway. Wait briefly for PENDING to become READY (the normal transition), then /fail;
+                # if it stays PENDING, leave it for OM to reclaim at the job timeout instead.
+                JobState = None
                 try:
-                    config.invoke_om_api_with_retry(
-                        method="POST",
-                        path=f"group/{cfg.GroupId}/clusters/{cfg.ClusterId}/snapshot/{SnapshotId}/fail",
-                    )
-                    config.write_host("  Backup cursor released.", fg=config.GREEN)
-                except Exception as e:  # noqa: BLE001
-                    config.write_host(f"  /fail call also failed: {e}", fg=config.RED)
+                    for _ in range(10):  # up to ~30s for PENDING -> READY
+                        JobState = config.invoke_om_api(
+                            path=f"group/{cfg.GroupId}/clusters/{cfg.ClusterId}/snapshot/{SnapshotId}"
+                        ).get("state")
+                        if JobState != "PENDING":
+                            break
+                        time.sleep(3)
+                except Exception:  # noqa: BLE001 - state unreadable: fall through and attempt /fail
+                    JobState = None
+                if JobState == "PENDING":
                     config.write_host(
-                        f"  Backup cursor will time out automatically in {TimeoutMinutes} minutes.",
+                        f"  Job {SnapshotId} is still PENDING - NOT calling /fail (it can wedge OM's "
+                        f"backup subsystem and is a no-op on a stuck PENDING job). OM reclaims the job "
+                        f"at its {TimeoutMinutes}-minute timeout; no backup cursor is open yet in "
+                        "PENDING, so nothing is pinned.",
                         fg=config.YELLOW,
                     )
+                else:
+                    config.write_host(
+                        f"  Calling /fail to release backup cursor on {SnapshotId} "
+                        f"(state={JobState or 'unknown'}) ...",
+                        fg=config.YELLOW,
+                    )
+                    try:
+                        config.invoke_om_api_with_retry(
+                            method="POST",
+                            path=f"group/{cfg.GroupId}/clusters/{cfg.ClusterId}/snapshot/{SnapshotId}/fail",
+                        )
+                        config.write_host("  Backup cursor released.", fg=config.GREEN)
+                    except Exception as e:  # noqa: BLE001
+                        config.write_host(f"  /fail call also failed: {e}", fg=config.RED)
+                        config.write_host(
+                            f"  Backup cursor will time out automatically in {TimeoutMinutes} minutes.",
+                            fg=config.YELLOW,
+                        )
             try:
                 _stop_transcript(transcript_logger)
             except Exception:
