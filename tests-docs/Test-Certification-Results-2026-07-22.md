@@ -215,3 +215,29 @@ routine given the intermittent tailing between tests; each re-baseline landed th
 tailers/cursors selected the **PRIMARY** per shard/RS. Both clusters left healthy; no leftover load/tailer
 processes. This exercises the same paths as the 2026-07-23 cert sweep plus the under-load (Tests 2–3) and
 no-load-drop (Test 1) variants.
+
+---
+
+## Density validation on `aen-prod` (2026-09-08, tag `om-20260908-170000`) — full PITR cycle PASS
+
+First end-to-end validation on the rebuilt customer-density lab: **33 replica sets** (32 shards + cfg),
+**5 members each (165 mongods)** across 6 hosts, **2×3T multi-PV LVM data VGs per node** (`/u01/data`),
+journals uniform in-place, OM oplog slices on a FlashBlade NFS store.
+
+| Phase | Result |
+|---|---|
+| `preflight-mongo-backup` | ✅ 9/9 PASS (after journal migration + PG build) |
+| Snapshot at 33-RS density | ✅ 33 cursors, balancer quiesced/restored, 4-array PG snap, `mongo:floor` tag |
+| Tailer at scale | ✅ 33 PRIMARY streams; backlog staged as **one tar stream per shard** (Tier-2 #11) |
+| **Below-floor PIT probe** | ✅ **REFUSED** (`target 1788903213 < floor 1788903273`) — the dead-zone guard works |
+| Restore `--pitr-target 0` | ✅ gate passed pre-overwrite; **first live multi-PV restore**: 12 volumes, VGs reassembled, 32 shards + cfg reformed in **145 s**, drift 0, `A=1 B=0` |
+| Replay-all | ✅ all-or-nothing validation passed; 256 segments / 32 shards; **`unrecoveredTail=0`**, `A=1 B=1` |
+
+**Three density findings fixed during the run** (each aborted safely pre-damage): the OM client timeout
+(30s hardcoded → `OM_HTTP_TIMEOUT_SEC`), restore STEP 0's volume-vs-array count conflation (multi-PV broke
+the single-volume assumption), and **balancer-state resurrection** — a sharded snapshot captures the
+quiesced balancer, so every restore silently left the balancer OFF; the pre-quiesce state is now a
+`mongo:balancer` tag that restore STEP 7.5 reapplies. Also fixed en route: `get_cluster_nodes` pagination
+(dense groups exceed one `/hosts` page — 4 of 6 hosts silently missing from the PG on first build).
+
+This run closes the "live validation pending" flag on the Tier-1 (`f5ef552`) and Tier-2 (`6751eab`) work.
