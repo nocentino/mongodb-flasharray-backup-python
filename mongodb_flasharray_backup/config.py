@@ -687,9 +687,21 @@ def get_cluster_nodes() -> list[str]:
         all_cluster_ids = [c.get("id") for c in results if c.get("clusterName") == om_cluster_name]
 
         # The /hosts endpoint returns all agents in the group; filter to hosts whose clusterId matches any
-        # of the cluster IDs collected above (shard or config RS members).
-        hosts_response = invoke_om_api(path=f"groups/{cfg.GroupId}/hosts", path_prefix="")
-        host_results = hosts_response.get("results", []) if isinstance(hosts_response, dict) else []
+        # of the cluster IDs collected above (shard or config RS members). The endpoint is PAGINATED
+        # (default 100/page) and a dense group can have hundreds of host entries — page through ALL of
+        # them, or nodes silently vanish from discovery (and from the protection group).
+        host_results: list = []
+        page = 1
+        while True:
+            hosts_response = invoke_om_api(
+                path=f"groups/{cfg.GroupId}/hosts?itemsPerPage=500&pageNum={page}", path_prefix=""
+            )
+            batch = hosts_response.get("results", []) if isinstance(hosts_response, dict) else []
+            host_results.extend(batch)
+            total = hosts_response.get("totalCount") if isinstance(hosts_response, dict) else None
+            if not batch or (total is not None and len(host_results) >= int(total)) or len(batch) < 500:
+                break
+            page += 1
         nodes = sorted({h.get("hostname") for h in host_results if h.get("clusterId") in all_cluster_ids})
         if len(nodes) > 0:
             write_host(f"  Cluster nodes discovered from Ops Manager ({len(nodes)}): {', '.join(nodes)}", fg=CYAN)
