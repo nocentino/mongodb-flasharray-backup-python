@@ -182,7 +182,7 @@ def _run(
                 agent_bad.append(f"{node}={state}")
             # Symlink escape guard: a dir under the data mount symlinked to another volume (journal!)
             # would be silently missing from the snapshot -> crash-inconsistent restore.
-            mnt = config.MONGO_DATA_MOUNT
+            mnt = config.data_mount()
             link_proc = subprocess.run(
                 ["ssh", *config.SSH_OPTS, f"{cfg.SshUser}@{node}",
                  f"find {mnt} -maxdepth 4 -type l -exec readlink -f {{}} \\; 2>/dev/null | head -20"],
@@ -197,7 +197,7 @@ def _run(
                 "; ".join(agent_bad) if agent_bad else f"active on all {len(nodes)} node(s)")
             add(_FAIL if link_bad else _PASS, "symlink guard",
                 "; ".join(link_bad[:5]) if link_bad
-                else f"no symlink under {config.MONGO_DATA_MOUNT} escapes the data volume")
+                else f"no symlink under {config.data_mount()} escapes the data volume")
 
     # --- 8. PG membership ------------------------------------------------------------------------------
     try:

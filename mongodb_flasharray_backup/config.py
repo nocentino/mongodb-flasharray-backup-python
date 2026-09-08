@@ -121,6 +121,9 @@ class Config:
     ClusterNodesFallback: Optional[list[str]]
     # Topology: 'sharded' (route via mongos/listShards) or 'replicaset' (target the RS directly).
     Topology: str
+    # Filesystem mount holding the MongoDB data (dbPath lives under it). Default /data/mongo;
+    # override per deployment with MONGO_DATA_MOUNT (e.g. /u01/data).
+    MongoDataMount: str
     # Selected deployment name, or None when the flat (single-deployment) keys are used.
     DeploymentName: Optional[str]
     # MongoDB database tools
@@ -211,6 +214,8 @@ def load_config(
     topology = (gd("TOPOLOGY", optional=True) or "sharded").strip().lower()
     if topology not in ("sharded", "replicaset"):
         raise RuntimeError(f"TOPOLOGY must be 'sharded' or 'replicaset', got '{topology}'")
+    # Data mount (dbPath parent). Optional; defaults to /data/mongo.
+    mongo_data_mount = (gd("MONGO_DATA_MOUNT", optional=True) or "/data/mongo").rstrip("/")
     # CLUSTER_NODES is optional - fallback only when Ops Manager is unreachable.
     cluster_nodes_raw = gd("CLUSTER_NODES", optional=True)
     cluster_nodes_fallback = cluster_nodes_raw.split(",") if cluster_nodes_raw else None
@@ -251,6 +256,7 @@ def load_config(
         SshUser=ssh_user,
         ClusterNodesFallback=cluster_nodes_fallback,
         Topology=topology,
+        MongoDataMount=mongo_data_mount,
         DeploymentName=deployment_name,
         MongoToolsBase=mongo_tools_base,
         MongodumpPath=mongodump_path,
@@ -814,7 +820,8 @@ def resolve_node_to_array_volume_map(
             if serial:
                 break
             proc = subprocess.run(
-                ["ssh", *ssh_opts_param, f"{ssh_user_param}@{node}", _SERIAL_CMD],
+                ["ssh", *ssh_opts_param, f"{ssh_user_param}@{node}",
+                 _SERIAL_CMD.replace("/data/mongo", data_mount())],
                 capture_output=True,
                 text=True,
             )
@@ -827,7 +834,7 @@ def resolve_node_to_array_volume_map(
         if not serial or not re.match(r"^[0-9a-f]{20,}$", serial):
             raise RuntimeError(
                 f"Could not read FA volume serial from {node} (got: '{serial}'). "
-                "Verify /data/mongo is mounted and the block device is a Pure Storage pRDM."
+                f"Verify {data_mount()} is mounted and the block device is a Pure Storage pRDM."
             )
         write_host(f"  {node} serial: {serial}", fg=CYAN)
 
@@ -901,7 +908,8 @@ def discover_node_volumes(fa: Any, nodes: list[str], ssh_user_param: str, ssh_op
     for node in nodes:
         serials: list[str] = []
         for attempt in range(1, 4):
-            proc = subprocess.run(["ssh", *ssh_opts_param, f"{ssh_user_param}@{node}", _MULTI_SERIAL_CMD],
+            proc = subprocess.run(["ssh", *ssh_opts_param, f"{ssh_user_param}@{node}",
+                                   _MULTI_SERIAL_CMD.replace("/data/mongo", data_mount())],
                                   capture_output=True, text=True)
             serials = parse_fa_volume_serials(proc.stdout)
             if serials:
@@ -910,7 +918,7 @@ def discover_node_volumes(fa: Any, nodes: list[str], ssh_user_param: str, ssh_op
                 time.sleep(1)
         if not serials:
             raise RuntimeError(
-                f"Could not resolve any FlashArray volume backing /data/mongo on {node}. Verify the mount "
+                f"Could not resolve any FlashArray volume backing {data_mount()} on {node}. Verify the mount "
                 "exists and its block device(s) are Pure pRDMs / multipath LUNs."
             )
         vols: list[dict] = []
@@ -940,7 +948,12 @@ def discover_node_volumes(fa: Any, nodes: list[str], ssh_user_param: str, ssh_op
 # we precompute it once per topology change (initialize-protection-groups) and store it on the FA volumes
 # as tags, then read it on the hot path (one GET /volumes/tags per array, no SSH). Tags use the 'mongo:'
 # key prefix in the default namespace and are copyable (so the map travels with snapshots/clones).
-MONGO_DATA_MOUNT = "/data/mongo"
+MONGO_DATA_MOUNT = "/data/mongo"  # default; per-deployment override via .env MONGO_DATA_MOUNT
+
+
+def data_mount() -> str:
+    """The configured data mount for the loaded deployment (default /data/mongo)."""
+    return CFG.MongoDataMount if CFG else MONGO_DATA_MOUNT
 VOLMAP_TAG_DEPLOYMENT = "mongo:deployment"
 VOLMAP_TAG_NODE = "mongo:node"
 VOLMAP_TAG_MOUNT = "mongo:mountpoint"
@@ -952,10 +965,11 @@ VOLMAP_TAG_PVCOUNT = "mongo:pvcount"  # total volumes backing this node's mount;
                                       # to act on an incomplete set instead of silently skipping a volume
 
 
-def write_volume_map_tags(fa: Any, deployment: Optional[str], node_map: dict, mountpoint: str = MONGO_DATA_MOUNT) -> int:
+def write_volume_map_tags(fa: Any, deployment: Optional[str], node_map: dict, mountpoint: Optional[str] = None) -> int:
     """Write the OS-disk -> FA-volume mapping onto each FA volume as copyable tags. `node_map` is
     node -> [ {'ShortName','VolumeName','Serial', optional 'Vg','PvIndex'} ] (one entry per backing
     volume; a single-volume node has a 1-element list). Returns the number of volumes tagged."""
+    mountpoint = mountpoint or data_mount()
     dep = deployment or ""
     n = 0
     for node, vols in node_map.items():
@@ -1034,12 +1048,13 @@ def read_volume_map_tags(fa: Any, deployment: Optional[str], context_names: list
 
 def resolve_node_volume_map(fa: Any, nodes: list[str], ssh_user_param: str, ssh_opts_param: list[str],
                             context_names: list[str], deployment: Optional[str],
-                            mountpoint: str = MONGO_DATA_MOUNT, verify: bool = True) -> dict[str, list]:
+                            mountpoint: Optional[str] = None, verify: bool = True) -> dict[str, list]:
     """Fast-path node -> [ {'ShortName','VolumeName','Serial','PvIndex'} ] resolver. Reads the precomputed
     volume-map tags (no SSH); when verify=True, cross-checks every tagged volume's serial against the array
     (one GET /volumes per array, no SSH) and, for any node that is untagged or has ANY stale/missing
     volume, falls back to live multi-volume SSH discovery for that node only. With no tags present this
     degrades to full discovery, so it is safe/backward-compatible."""
+    mountpoint = mountpoint or data_mount()
     tagged = read_volume_map_tags(fa, deployment, context_names)
     resolved: dict[str, list] = {}
     fallback_nodes: list[str] = []

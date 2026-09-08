@@ -136,6 +136,10 @@ def _run(
     # SIGTERM must run the same finally-cleanup as Ctrl-C (restart agents on abort, release the lock).
     config.install_sigterm_handler()
 
+    # Data mount for this deployment (default /data/mongo; e.g. /u01/data). All device discovery,
+    # unmount, and remount below operate on this mount.
+    mnt = config.data_mount()
+
     # region --- Configuration ---
     wait_timeout_sec = 600   # Max seconds to wait for cluster to stabilize
     poll_interval_sec = 10   # Seconds between readiness polls
@@ -396,6 +400,7 @@ def _run(
                     "| awk '$2 == \"disk\" {print $1}' | sort -u; "
                     "else lsblk -dno NAME,SERIAL 2>/dev/null | awk '$2 ~ /^[0-9a-fA-F]{20,}$/ {print $1}'; fi"
                 )
+                cmd = cmd.replace("/data/mongo", mnt)
                 proc = subprocess.run(
                     ["ssh", *config.SSH_OPTS, f"{config.CFG.SshUser}@{node}", cmd],
                     capture_output=True,
@@ -404,7 +409,7 @@ def _run(
                 disks = [d.strip() for d in proc.stdout.splitlines() if re.match(r"^[a-z0-9]+$", d.strip())]
                 if not disks:
                     raise RuntimeError(
-                        f"Could not derive backing block device(s) for /data/mongo on {node} "
+                        f"Could not derive backing block device(s) for {mnt} on {node} "
                         f"(got: '{proc.stdout.strip()}'). Verify the Pure pRDM / multipath LUNs are presented."
                     )
                 node_devices[node] = disks
@@ -416,7 +421,7 @@ def _run(
                     "\n  WARNING: This will OVERWRITE the live data volumes on:", fg=config.RED
                 )
                 for node in cluster_nodes:
-                    config.write_host(f"    - {node} (/data/mongo)", fg=config.RED)
+                    config.write_host(f"    - {node} ({mnt})", fg=config.RED)
                 config.write_host(
                     f"  Any data written since snapshot {snapshot_tag} will be LOST.", fg=config.RED
                 )
@@ -490,8 +495,8 @@ def _run(
             config.invoke_parallel_or_throw(cluster_nodes, _step2_stop_mongo, "Stop mongod/mongos")
             # endregion
 
-            # region --- STEP 3: Unmount /data/mongo (idempotent) ---
-            config.write_host("\n=== STEP 3: Unmounting /data/mongo ===", fg=config.YELLOW)
+            # region --- STEP 3: Unmount the data mount (idempotent) ---
+            config.write_host(f"\n=== STEP 3: Unmounting {mnt} ===", fg=config.YELLOW)
 
             # Worker run in parallel across nodes.
             def _step3_unmount(node):
@@ -512,6 +517,7 @@ def _run(
                     "  echo already-unmounted\n"
                     "fi"
                 )
+                cmd = cmd.replace("/data/mongo", mnt)
                 proc = subprocess.run(
                     ["ssh", *opts, f"{user}@{node}", cmd],
                     capture_output=True,
@@ -525,7 +531,7 @@ def _run(
                 config.write_host(f"  {node}: {first_line}", fg=config.GREEN)
                 return {"Node": node, "Success": True, "Message": out}
 
-            config.invoke_parallel_or_throw(cluster_nodes, _step3_unmount, "Unmount /data/mongo")
+            config.invoke_parallel_or_throw(cluster_nodes, _step3_unmount, f"Unmount {mnt}")
             # endregion
 
             # region --- STEP 4: Overwrite FlashArray volumes from snapshots (sequential) ---
@@ -589,9 +595,9 @@ def _run(
                 )
             # endregion
 
-            # region --- STEP 5: Rescan LUN + remount /data/mongo ---
+            # region --- STEP 5: Rescan LUN + remount the data mount ---
             config.write_host(
-                "\n=== STEP 5: Rescanning LUN and remounting /data/mongo ===", fg=config.YELLOW
+                f"\n=== STEP 5: Rescanning LUN and remounting {mnt} ===", fg=config.YELLOW
             )
 
             # Worker run in parallel across nodes.
@@ -641,8 +647,9 @@ def _run(
                     "mountpoint -q /data/mongo\n"
                     'echo "mounted"'
                 )
+                cmd = cmd.replace("/data/mongo", mnt)
                 config.write_host(
-                    f"  {node}: rescan {len(disks)} device(s) + reactivate LVM + mount /data/mongo ...",
+                    f"  {node}: rescan {len(disks)} device(s) + reactivate LVM + mount {mnt} ...",
                     fg=config.CYAN,
                 )
                 proc = subprocess.run(
