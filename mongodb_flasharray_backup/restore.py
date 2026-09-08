@@ -262,20 +262,23 @@ def _run(
                     "  PITR gate: captured stream is complete and reaches the target.", fg=config.GREEN
                 )
 
-            # mongo:volumes records the volume names that were part of this snapshot.
+            # mongo:volumes records the volume names that were part of this snapshot. NOTE the two
+            # distinct counts: the PG snapshot exists ONCE PER ARRAY, while a multi-PV node contributes
+            # SEVERAL volumes per array - so array-presence is checked against the array count and
+            # member/volume completeness against the volume count (conflating them broke multi-PV).
             if snap_tags.get("mongo:volumes"):
-                expected_snap_count = len(snap_tags["mongo:volumes"].split(","))
+                expected_volume_count = len(snap_tags["mongo:volumes"].split(","))
                 config.write_host(
-                    f"  Snapshot volumes from tag ({expected_snap_count}): {snap_tags['mongo:volumes']}",
+                    f"  Snapshot volumes from tag ({expected_volume_count}): {snap_tags['mongo:volumes']}",
                     fg=config.GREEN,
                 )
             else:
-                expected_snap_count = len(fa_context_names)
+                expected_volume_count = None
                 config.write_host(
-                    f"  mongo:volumes tag absent - expected count falls back to fleet discovery "
-                    f"({expected_snap_count} arrays)",
+                    "  mongo:volumes tag absent - volume-count completeness check will be skipped",
                     fg=config.YELLOW,
                 )
+            expected_array_count = len(fa_context_names)
 
             # Verify the target snapshot exists on all context arrays via the gateway.
             snap_check: list = []
@@ -305,9 +308,9 @@ def _run(
                         f"  Snapshot '{snapshot_tag}' NOT found on {ctx_name} after {attempt} attempt(s)",
                         fg=config.RED,
                     )
-            if len(snap_check) != expected_snap_count:
+            if len(snap_check) != expected_array_count:
                 raise RuntimeError(
-                    f"Snapshot '{snapshot_tag}' found on {len(snap_check)} of {expected_snap_count} "
+                    f"Snapshot '{snapshot_tag}' found on {len(snap_check)} of {expected_array_count} "
                     f"expected arrays - aborting before any changes are made."
                 )
             config.write_host(f"  All {len(snap_check)} snapshots confirmed.", fg=config.GREEN)
@@ -329,9 +332,9 @@ def _run(
             # Guard: every expected volume must have been resolved (count across all nodes' volumes,
             # since a multi-volume/LVM node maps to several FA volumes).
             _discovered_vols = sum(len(v) for v in node_volume_map.values())
-            if _discovered_vols != expected_snap_count:
+            if expected_volume_count is not None and _discovered_vols != expected_volume_count:
                 raise RuntimeError(
-                    f"Volume resolution found {_discovered_vols} of {expected_snap_count} "
+                    f"Volume resolution found {_discovered_vols} of {expected_volume_count} "
                     "expected volumes - aborting before any changes are made. Verify all cluster nodes "
                     "are reachable and their data volumes are presented."
                 )
@@ -827,6 +830,45 @@ def _run(
                     fg=config.GREEN,
                 )
                 ready = True
+            # endregion
+
+            # region --- STEP 7.5: Restore the balancer state (sharded) ---
+            # The snapshot is taken with the balancer QUIESCED, so the restored config server says
+            # "stopped" — without this, every sharded restore silently leaves the balancer off forever.
+            # The snapshot records the pre-quiesce state in the mongo:balancer tag; put it back.
+            if config.CFG.Topology == "sharded":
+                balancer_tag = snap_tags.get("mongo:balancer")
+                if balancer_tag == "enabled":
+                    try:
+                        config.invoke_mongosh_js(
+                            ssh_target=config.CFG.MongosHost,
+                            uri=f"mongodb://{config.CFG.MongosHost}:{config.CFG.MongosPort}",
+                            js="sh.startBalancer(); print('balancer='+sh.getBalancerState());",
+                            max_attempts=3,
+                            context="restore balancer state",
+                        )
+                        config.write_host(
+                            "  Balancer re-enabled (snapshot's pre-quiesce state was 'enabled').",
+                            fg=config.GREEN,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        config.write_host(
+                            f"  WARNING: could not re-enable the balancer: {e}. Re-enable manually via "
+                            "mongos: sh.startBalancer()",
+                            fg=config.RED,
+                        )
+                elif balancer_tag == "disabled":
+                    config.write_host(
+                        "  Balancer left disabled (it was disabled before the snapshot too).",
+                        fg=config.DARK_GRAY,
+                    )
+                else:
+                    config.write_host(
+                        "  WARNING: mongo:balancer tag absent (pre-tag snapshot) — the restored cluster's "
+                        "balancer is likely OFF (the snapshot captured the quiesced state). Check "
+                        "sh.getBalancerState() and re-enable if appropriate.",
+                        fg=config.YELLOW,
+                    )
             # endregion
 
             # region --- STEP 8: Verify data ---

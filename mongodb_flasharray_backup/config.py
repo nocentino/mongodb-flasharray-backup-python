@@ -457,7 +457,9 @@ def invoke_om_api(
     probe_headers = {"Accept": "application/json"}
     if method != "GET":
         probe_headers["Content-Type"] = "application/json"
-    probe = requests.request(method, uri, headers=probe_headers, data=body_data, timeout=30)
+    # Dense clusters (30+ RS) make some OM calls take well over 30s; timeout is env-tunable.
+    _om_timeout = int(os.environ.get("OM_HTTP_TIMEOUT_SEC", "120"))
+    probe = requests.request(method, uri, headers=probe_headers, data=body_data, timeout=_om_timeout)
     if probe.status_code != 401:
         raise RuntimeError(
             f"Expected 401 Digest challenge from {uri} but got HTTP {probe.status_code}: {probe.text}"
@@ -496,7 +498,7 @@ def invoke_om_api(
     headers = {"Accept": "application/json", "Authorization": auth_header}
     if content_type:
         headers["Content-Type"] = content_type
-    resp = requests.request(method, uri, headers=headers, data=body_data, timeout=30)
+    resp = requests.request(method, uri, headers=headers, data=body_data, timeout=_om_timeout)
     resp.raise_for_status()
     text = resp.text
     if not text:

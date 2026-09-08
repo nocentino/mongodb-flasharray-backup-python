@@ -720,6 +720,13 @@ def _run(
                             presnap_value,
                         ]
                         tag_copyable = [True, True, True, True, True]
+                        # The snapshot is taken with the balancer QUIESCED, so the on-disk config.settings
+                        # says "stopped" - a restore would resurrect that. Record the pre-quiesce state so
+                        # restore can put the balancer back the way the cluster actually ran.
+                        if BalancerWasEnabled is not None:
+                            tag_keys.append("mongo:balancer")
+                            tag_values.append("enabled" if BalancerWasEnabled else "disabled")
+                            tag_copyable.append(True)
                         snap_resp = FA.post_protection_group_snapshots(
                             context_names=[CtxName],
                             source_names=[cfg.ProtectionGroupName],
