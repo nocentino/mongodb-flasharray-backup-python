@@ -273,3 +273,25 @@ fails with an OM-internal `NullPointerException` in `handleOplogAndSyncStoreReas
 (`BackupStatus` null) that does not trace to any residual appdb doc after force-unmanage cleanup. Recommended
 path: recreate the RS under a **fresh cluster identity** (the reused July `clusterId` carries state that keeps
 tripping the NPE), or raise with MongoDB. RS backup validation deferred.
+
+---
+
+## `aen-rs-01` recreated (fresh identity) + PITR validated (2026-09-09, tag `om-20260909-190000`)
+
+The old `aen-rs-00` third-party `manage` failed with an OM-internal NPE
+(`handleOplogAndSyncStoreReassignmentReplicaSet`, null `BackupStatus`) that no residual-doc cleanup fixed.
+**Root cause: the reused July `clusterId` (6a2a9456).** Recreating the RS under a **fresh identity** resolved it:
+
+- Renamed `aen-rs-00` -> **`aen-rs-01`** (new dbPath `/u01/data/rs01`) via the automationConfig API; agents
+  converged; orphaned old `rs00` mongods (holding :27017) were graceful-shutdown from localhost via mongosh.
+- OM created a fresh hostCluster (id `6aa197b72a10026ff73f3d5c`, display name `Cluster_0`) and, on a
+  duplicate-key conflict, **auto-deleted the stale `aen-rs-00` (6a2a9456) record** — clearing the identity that
+  caused the NPE. `manage -> OK`, 1/1 snapshotable on the new id.
+- `initialize-protection-groups --deployment aen-rs-01` created `aen-rs-01-pg` (6 volumes on 05/06/07).
+  **preflight 9/9 PASS.**
+- **PITR cycle:** tailer on primary `-06` -> snapshot T1 + marker A -> marker B + 2000 docs -> drain -> restore
+  `--pitr-target 0` (gate passed; RS `replicaset` branch; drift 0; `A=1 B=0`) -> replay (5 segments,
+  `unrecoveredTail=0`, `A=1 B=1`). First RS validation on the `/u01/data` mount.
+
+**Lesson:** an OM replica-set `manage` NPE that survives force-unmanage residue cleanup is an OM identity-state
+problem — recreate the RS under a new name/clusterId rather than surgically chasing appdb ghosts.
