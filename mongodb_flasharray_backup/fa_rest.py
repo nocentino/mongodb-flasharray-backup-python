@@ -309,7 +309,17 @@ class Client:
         return self._routed("POST", "protection-group-snapshots", context_names=context_names,
                             params={"source_names": self._csv(source_names)}, body=protection_group_snapshot)
 
+    def patch_protection_group_snapshots(self, names: Optional[list] = None,
+                                         protection_group_snapshot: Any = None,
+                                         context_names: Optional[list] = None):
+        """PATCH a PG snapshot (e.g. {"destroyed": true} to destroy, or {"destroyed": false} to restore
+        from the eradication pending state)."""
+        return self._routed("PATCH", "protection-group-snapshots", context_names=context_names,
+                            params={"names": self._csv(names)}, body=protection_group_snapshot)
+
     def delete_protection_group_snapshots(self, names: Optional[list] = None, context_names: Optional[list] = None):
+        """Eradicate a PG snapshot. Purity requires it be DESTROYED first (patch destroyed=true), else it
+        returns 'Protection group snapshot is not destroyed'."""
         return self._routed("DELETE", "protection-group-snapshots", context_names=context_names,
                             params={"names": self._csv(names)})
 
