@@ -211,7 +211,11 @@ def _run(
     # Prune orphaned PG volume members.
     if prune:
         config.write_host("\n=== Pruning orphaned PG members ===", fg=config.YELLOW)
-        discovered_volume_names = [v["VolumeName"] for v in node_volume_map.values()]
+        # node_volume_map maps node -> LIST of volume dicts (a multi-PV node has several); flatten so a
+        # 2-volume node's volumes are BOTH treated as live and not pruned.
+        discovered_volume_names = [
+            v["VolumeName"] for vols in node_volume_map.values() for v in vols
+        ]
 
         # Enumerate all planned removals across the fleet.
         prune_targets: list[dict[str, str]] = []
