@@ -241,3 +241,35 @@ quiesced balancer, so every restore silently left the balancer OFF; the pre-quie
 (dense groups exceed one `/hosts` page — 4 of 6 hosts silently missing from the PG on first build).
 
 This run closes the "live validation pending" flag on the Tier-1 (`f5ef552`) and Tier-2 (`6751eab`) work.
+
+---
+
+## Cluster reshape + re-validation (2026-09-09): `aen-prod` 33-RS -> 3-shard, full PITR PASS
+
+Reduced the dense lab to a maintainable shape and re-validated end to end. Sequence (the ordering is the
+lesson): **unmanage third-party backup FIRST**, then reshape topology, then re-manage — reversing it wedges OM.
+
+- **Phase 1 (unmanage):** the API `unmanage` accepted but stuck (the documented `Stop backup request failed`
+  catch-22); cleared via **force-unmanage** (backup+delete the group's `backupjobs.clusters`/`jobs`/
+  `thirdparty.jobs`, restart `mongodb-mms`).
+- **Phase 2-3 (reshape):** emptied the automationConfig (agents orphan mongods -> stop+wipe out of band),
+  then PUT a new topology: **3 shards x 3 members + 3-member config RS on `aen-mongo-01..04`**, 2 mongos.
+  Agents converged 17/17 in ~40 s.
+- **Phase 4 (re-enable):** `/manage` (sharded OK); `initialize-protection-groups --prune --force` cut
+  `aen-prod-pg` from 12 volumes to the 8 of nodes 01-04; **purged 422 stale OM monitored-host records**
+  (leftover 33-RS members) so discovery returns exactly the live topology; cleared stale `mongo:` tags on the
+  removed 06/07 volumes. **`preflight-mongo-backup`: 9/9 PASS.**
+- **Phase 5 (validate, tag `om-20260909-180000`):** tailer (4 PRIMARY streams) -> snapshot T1 + marker A ->
+  marker B + 2000 docs -> drain -> restore `--pitr-target 0` (PITR gate passed pre-overwrite; **balancer
+  auto-restored from the `mongo:balancer` tag**; 8 volumes, cluster reformed, drift 0, `A=1 B=0`) ->
+  replay-all (21 segments/3 shards, `unrecoveredTail=0`, `A=1 B=1`). Balancer left ON, cluster healthy.
+
+**Bugs found + fixed during the reshape:** `get_cluster_nodes` OM `/hosts` **pagination** (dense group > one
+page silently dropped member hosts) and `initialize-protection-groups --prune` assuming **one volume per node**
+(TypeError on multi-PV VGs). Both committed.
+
+**`aen-rs-00` (3-member RS on 05/06/07): rebuilt and healthy, third-party backup NOT enabled.** Its `/manage`
+fails with an OM-internal `NullPointerException` in `handleOplogAndSyncStoreReassignmentReplicaSet`
+(`BackupStatus` null) that does not trace to any residual appdb doc after force-unmanage cleanup. Recommended
+path: recreate the RS under a **fresh cluster identity** (the reused July `clusterId` carries state that keeps
+tripping the NPE), or raise with MongoDB. RS backup validation deferred.
