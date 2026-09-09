@@ -295,3 +295,35 @@ The old `aen-rs-00` third-party `manage` failed with an OM-internal NPE
 
 **Lesson:** an OM replica-set `manage` NPE that survives force-unmanage residue cleanup is an OM identity-state
 problem — recreate the RS under a new name/clusterId rather than surgically chasing appdb ghosts.
+
+---
+
+## Full certification pass on the reshaped lab (2026-09-09) — ALL PASS
+
+Ran the certification suite core-first-then-full on the standing lab (`aen-prod` 3-shard + `aen-rs-01` RS),
+build `main` @ current. Preflight 9/9 PASS on both deployments before starting.
+
+**Phase A — core 4 (the four in-scope cert items):**
+
+| Item | Deployment | Tag | Result |
+|---|---|---|---|
+| 2.A.a Sharded self-restore | aen-prod | `om-20260909-200001` | ✅ drift 0, sentinel gone, per-shard 2279+2297+2424=7000 |
+| 2.B.e Sharded PIT | aen-prod | `om-20260909-200002` | ✅ restore→T1 A=1 B=0 (drift 0); replay→T2 A=1 B=1, unrecoveredTail=0 |
+| 1.A.1.a RS self-restore | aen-rs-01 | `om-20260909-200003` | ✅ drift 0, sentinel gone |
+| 1.B.1.a RS PIT | aen-rs-01 | `om-20260909-200004` | ✅ restore→T1 A=1 B=0; replay→T2 A=1 B=1, unrecoveredTail=0 |
+
+**Phase B — full Test-SnapshotRestore suite (remaining tests; 4/5/6/7 = the core above):**
+
+| # | Test | Tag | Result |
+|---|---|---|---|
+| 1 | Basic restore (no load) | `om-20260909-200005` | ✅ drop → restore → 9000, drift 0 |
+| 2 | Restore under load | `om-20260909-200006` | ✅ 147,334 ∈ [146,800, 147,600] (drift 800); post-snap writes to 175,800 lost |
+| 3 | PITR under load | `om-20260909-200007` | ✅ restore→T1 240,134 (in window); replay→T2 **278,534, unrecoveredTail=0** |
+| 8 | Sharded snapshot quiesces balancer | `om-20260909-200008` | ✅ balancer true → stopped → re-enabled → true |
+
+Every guard exercised live: the PITR pre-overwrite gate passed before each destructive PIT restore, the
+floor guard + all-or-nothing per-shard window validation ran on every replay, and the balancer was
+stopped+restored on every sharded snapshot. Both clusters left healthy (aen-prod 3 shards / balancer on;
+aen-rs-01 3 members); no leftover load/tailer processes.
+
+**Verdict: the full in-scope certification suite passes on the reshaped, current lab.**
