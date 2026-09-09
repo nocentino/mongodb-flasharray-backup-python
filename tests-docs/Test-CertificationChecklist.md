@@ -8,6 +8,16 @@ implementation, how to run it, and current status. **For a shareable, high-level
 [Test-FailoverAndCompliance.md](Test-FailoverAndCompliance.md) (failover / verification); recorded results live
 alongside in the `*-Results.md` files.
 
+> **Re-validation run 2026-09-09** (current standing lab): after the lab was reshaped to the 3-shard **`aen-prod`**
+> sharded cluster (3 data shards ×3 + a dedicated 3-member config RS + 2 `mongos` on `aen-mongo-01..04`, PG
+> `aen-prod-pg`) and the 3-member **`aen-rs-01`** replica set (`aen-mongo-05/06/07`, PG `aen-rs-01-pg`) — the earlier
+> `aen-cluster`/`aen-rs-00` names are retired — both deployments passed `preflight-mongo-backup` **9/9** and a full
+> **snapshot → restore (`--pitr-target 0`) → PITR replay** cycle with A/B markers: **drift 0** at T1 and
+> **`unrecoveredTail=0`** at T2, on `aen-prod` (tag `om-20260909-180000`) and `aen-rs-01` (tag `om-20260909-190000`).
+> Multi-PV LVM restore validated live. *(A dense 32-shard / 33-RS × 5-member `aen-prod` build was a 2026-09-08
+> customer-density **scale test** — tag `om-20260908-170000` — not the standing shape.)* The dated result cells and
+> runbook entries below that name `aen-cluster`/`aen-rs-00` remain accurate history for the lab as it was then.
+>
 > **Re-validation run 2026-07-23** (build `130435a`, **primary-sourced** backup cursor + oplog stream): the
 > four core in-scope tests all re-passed live — **1.A.1.a** + **2.A.a** (self-restore, drift 0 / sentinel-gone)
 > and **1.B.1.a** + **2.B.e** (PIT, `unrecoveredTail=0`, deterministic marker B recovered). The tailer + cursor
@@ -63,7 +73,8 @@ per-item status and rationale follow in the sections below.
 - **Restore model confirmed with MongoDB (2026-07-22):** the per-member snapshot + **whole-cluster revert** (all members overwritten from their own snapshots, reverted together) is a supported model. Members reconcile via normal replication/rollback on restart — valid **as long as the primary retains enough oplog to span the snapshot→revert-point gap** (otherwise a lagging member hits `OplogStartMissing`). Size the oplog above the replication lag at snapshot time. (The snapshot's backup cursor and the oplog tailer both target the **primary** now, so the pinned/consistent member is the freshest; secondaries trail it by their replication lag — keep that lag low to keep the reconciliation spread small.) See [how-it-works.md](../docs/how-it-works.md) → "Whole-cluster revert and the oplog-window requirement". (A single-source clone-to-all alternative — "Path A" — was prototyped and reverted once MongoDB confirmed this model.)
 
 ## Status legend
-- ✅ **Validated** — exercised live against `aen-cluster` (see referenced doc / results).
+- ✅ **Validated** — exercised live against the lab cluster (`aen-prod`; earlier dated runs on its retired
+  predecessor `aen-cluster`) (see referenced doc / results).
 - 🟡 **Supported, not yet tested** — handled by the implementation; not exercised here.
 - ⚙️ **Supported with operator procedure** — works, but requires the noted setup step.
 - ⚠️ **Gap / differs** — applicable cert item the implementation handles differently or only partially.
@@ -87,11 +98,16 @@ per-item status and rationale follow in the sections below.
 - **Full snapshots only.** FlashArray protection-group snapshots are always full (CoW); `new-mongo-snapshot`
   takes full snapshots and stores no incremental chain (`srcBackupName` is never used). **All *Incremental Backup
   Tests* are ❌** (not a concept for storage-snapshot backup).
-- **Topology:** validated on (a) **`aen-cluster`** — restructured to a **dedicated config server**
-  (`aen-shard_0` on `aen-mongo-config-00`) + **3 data shards** (`aen-shard_1/2/3` on aen-mongo-01/02/03); and
-  (b) **`aen-rs-00`** — a **standalone 3-member replica set** (aen-mongo-05/06/07). One FlashArray data volume per
-  node in a Fusion fleet, driven by the hybrid gateway-routed FA client. Backup protection groups follow a
-  `<cluster-name>-pg` convention (`aen-cluster-pg`, `aen-rs-00-pg`).
+- **Topology (current standing lab, 2026-09-09):** validated on (a) **`aen-prod`** (default, `--deployment aen-prod`)
+  — a sharded cluster of **3 data shards (×3 members)** + a **dedicated 3-member config RS** + **2 `mongos`** across
+  **`aen-mongo-01..04`** (PG `aen-prod-pg` = 8 volumes); and (b) **`aen-rs-01`** (`--deployment aen-rs-01`) — a
+  **standalone 3-member replica set** (`aen-mongo-05/06/07`, PG `aen-rs-01-pg` = 6 volumes). Each node's data mount
+  (`/u01/data` in this lab — configurable per deployment via `MONGO_DATA_MOUNT`, default `/data/mongo`) is an LVM
+  volume group (`vg_database`) over FlashArray volumes in a Fusion fleet, driven by the hybrid gateway-routed FA
+  client. Backup protection groups follow a `<deployment>-pg` convention. Both pass `preflight-mongo-backup` 9/9 and
+  were re-validated end-to-end 2026-09-09. *(A dense 32-shard / 33-RS × 5-member build was a 2026-09-08
+  customer-density scale test — tag `om-20260908-170000` — not the standing shape. The earlier names `aen-cluster`
+  and `aen-rs-00` are retired; the dated per-item cells below that use them remain accurate history.)*
 
 ## Data-insertion & verification methodology (per the checklist)
 - **Non-PIT:** insert **data set A** → `new-mongo-snapshot` → insert **data set B** → restore → verify **A and
@@ -125,7 +141,8 @@ mongos() { ssh "${SSH_OPTS[@]}" "${SSH_USER}@${MONGOS_HOST}" "${MONGOSH_PATH} --
 Validated against **`aen-rs-00`** — a standalone 3-member replica set (aen-mongo-05/06/07). OM third-party backup
 was enabled via the `backup/third_party/.../manage` endpoint (**no OM snapshot store required** — the FlashArray
 holds the snapshots; the standard `backupConfigs statusName=STARTED` path is wrong here and 409s "no available
-Snapshot Store"). Run any command with `--deployment aen-rs-00`.
+Snapshot Store"). Run any command with `--deployment aen-rs-01` (the current RS deployment, same 3-node shape; the
+dated cells below were validated on its retired predecessor `aen-rs-00`).
 
 | # | Official checklist item | Applicability | How / Status |
 |---|---|---|---|

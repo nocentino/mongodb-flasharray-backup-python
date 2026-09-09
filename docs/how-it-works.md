@@ -177,8 +177,8 @@ Node selection is **topology-agnostic**: it iterates the cluster detail's `repli
 backup view), **not** `listShards`. The same code path covers both deployment types:
 
 - **Sharded cluster** — `nodeIds` includes **exactly one snapshotable node from each shard's RS AND the config
-  RS**. For `aen-cluster` (dedicated config): one node from each of `aen-shard_0` (config), `aen-shard_1`,
-  `aen-shard_2`, `aen-shard_3`.
+  RS**. For `aen-prod` (dedicated config): one node from each of `prod-cfg` (config), `prod-shard_01`,
+  `prod-shard_02`, `prod-shard_03`.
 - **Standalone replica set** (`TOPOLOGY=replicaset`, selected with `--deployment <name>`) — the cluster detail
   returns a single `replicaSet`; `nodeIds` is one snapshotable member of it.
 - Node ID format: `"hostname:port"` — e.g. `"aen-mongo-01:27021"` (sharded) or `"aen-mongo-06.fsa.lab:27017"` (RS).
@@ -236,7 +236,7 @@ WiredTiger continuously checkpoints data to disk and maintains a write-ahead jou
 
 ```
 STEP 4: FA volume overwritten from snapshot (metadata-only CoW flip, sub-second)
-STEP 5: Linux rescans the block device, remounts /data/mongo
+STEP 5: Linux rescans the block device, remounts the data mount (MONGO_DATA_MOUNT, /u01/data in this lab)
 STEP 6: automation agent starts mongod → WiredTiger crash recovery runs automatically
 STEP 7: poll until all shard primaries elect
 ```
@@ -396,12 +396,18 @@ Restore adds defence-in-depth on top of resolution: it confirms the resolved vol
 
 ### Step 1 — Find the mounted partition (`findmnt`)
 
+> The data mount is **configurable per deployment** via the `MONGO_DATA_MOUNT` `.env` key (default
+> `/data/mongo`; `/u01/data` in this lab). The discovery chain reads whatever mount is configured — the
+> examples below use `/u01/data`. dbPaths (e.g. `/u01/data/shard01`, `/u01/data/cfg`, `/u01/data/rs01`) live
+> under it, and the WiredTiger journal is in-place inside the dbPath.
+
 ```bash
-findmnt -no SOURCE /data/mongo
+findmnt -no SOURCE /u01/data
 # → /dev/sdb1
 ```
 
-`findmnt` queries the kernel mount table to find which block device partition is currently mounted at `/data/mongo`. This is the authoritative answer: no assumptions about device names.
+`findmnt` queries the kernel mount table to find which block device partition is currently mounted at the
+configured data mount (`/u01/data` here). This is the authoritative answer: no assumptions about device names.
 
 ### Step 2 — Walk up to the parent disk (`lsblk PKNAME`)
 
@@ -421,7 +427,7 @@ lsblk -no SERIAL /dev/sdb
 
 Every Pure Storage volume has a SCSI page-80 serial embedded in the block device — a 24-character NAA hex string that encodes the volume's WWN. This serial is stable across reboots and remounts and is guaranteed globally unique within the array fleet. It is the single durable identifier linking the Linux block device to a specific FlashArray volume.
 
-> **Fallback (mid-restore, volume not mounted):** if `findmnt` finds nothing at `/data/mongo`, the command instead scans all disks for any serial matching the FA format (`^[0-9a-fA-F]{20,}$`). Since each node has exactly one FA data volume, this is unambiguous.
+> **Fallback (mid-restore, volume not mounted):** if `findmnt` finds nothing at the configured data mount, the command instead scans all disks for any serial matching the FA format (`^[0-9a-fA-F]{20,}$`). For an LVM multi-PV node the walk collects *all* the VG's backing volumes (see the LVM path above).
 
 ### Step 4 — Resolve serial to FlashArray volume (`GET /volumes?filter=serial=…`)
 

@@ -1,12 +1,23 @@
 # Test: Snapshot and Restore
 
-Validates the end-to-end snapshot and restore flow for both deployments: the `aen-cluster` sharded cluster
-(Tests 1–5, 8) and the `aen-rs-00` standalone replica set (Tests 6–7).
+Validates the end-to-end snapshot and restore flow for both deployments: the **`aen-prod`** sharded cluster
+(Tests 1–5, 8) and the **`aen-rs-01`** standalone replica set (Tests 6–7). Run each command with the matching
+`--deployment` (`aen-prod` is the default). The data mount is **`/u01/data`** in this lab — configurable per
+deployment via the `MONGO_DATA_MOUNT` `.env` key (default `/data/mongo`).
+
+> **Retired names:** some worked-example command blocks below still show the earlier `aen-cluster` / `aen-rs-00`
+> deployment names alongside their dated snapshot tags — those are preserved as historical runs. Use
+> **`aen-prod`** / **`aen-rs-01`** when running the steps today.
+
+> **Recommended first step — preflight.** Before any snapshot, run `preflight-mongo-backup --deployment <name>`.
+> It is a read-only readiness gate (third-party registration / oplogType, in-flight jobs, snapshotable verdicts,
+> stale `preferredOplogNodes`, FCV skew, agent health, a symlink-escape guard under the data mount, and PG
+> membership) and exits non-zero on any FAIL. Both deployments currently pass **9/9**.
 
 > **Replica-set deployments:** the same procedure applies to a standalone replica set — append
-> `--deployment aen-rs-00` to every command and point `mongosh` at an RS member instead of `mongos`. Fully worked
+> `--deployment aen-rs-01` to every command and point `mongosh` at an RS member instead of `mongos`. Fully worked
 > RS runs are in **Test 6** (self-restore, fidelity proof) and **Test 7** (PIT with A/B markers) below; Tests 1–5
-> and 8 use the sharded `aen-cluster` (Test 8 checks the balancer quiesce/restore).
+> and 8 use the sharded `aen-prod` (Test 8 checks the balancer quiesce/restore).
 
 > **Run each step manually in separate terminals.** Multi-stage workflows that combine a long-running background process (e.g. `start-insert-load`) with a foreground operation (e.g. `new-mongo-snapshot`) in the same pipeline will deadlock — the parent shell waits for stdout to drain before reading the next pipe stage, and both sides block. Each process must run in its own independent terminal with no shared pipe.
 
@@ -207,6 +218,8 @@ restore-mongo-snapshot --snapshot-tag "om-20260506-120000"
 ```
 
 At this point the cluster is at T1. All writes between T1 and T2 are missing. STEP 8's baseline check confirms the cluster matches the T1 baseline tags before oplog replay begins.
+
+For a PIT restore, add `--pitr-target <unix-ts|0>` (`0` = the full captured stream): `restore-mongo-snapshot` then verifies the captured oplog stream actually **reaches** that target *before* overwriting any volume, so a short or stale stream fails loud instead of after the destructive step. On a sharded restore, STEP 7.5 also restores the balancer to the pre-snapshot state recorded in the `mongo:balancer` tag.
 
 **7. Replay the oplog segments to advance the cluster to T2.**
 
@@ -486,7 +499,7 @@ An RS helper (uses the RS member host from `.env`; run the session-setup block f
 
 ```bash
 rs() {
-    ssh "${SSH_OPTS[@]}" "${SSH_USER}@${AEN_RS_00__MONGOS_HOST}" \
+    ssh "${SSH_OPTS[@]}" "${SSH_USER}@${AEN_RS_01__MONGOS_HOST}" \
         "${MONGOSH_PATH} --quiet --eval '$1'"
 }
 ```

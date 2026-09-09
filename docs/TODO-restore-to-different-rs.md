@@ -37,9 +37,9 @@ resolution; surface clear errors when replication hasn't completed.
 ### 3. PITR to a different RS (1.B.1.b / 1.B.1.c)
 Extend `start-oplog-tailer` / `invoke-oplog-replay` to apply oplogs onto the different RS after the
 snapshot restore (and 1.B.1.c: handle a destination that includes an **arbiter** — arbiters hold no data,
-are never snapshotable, and must be excluded from data steps but counted for RS quorum). **Gated on
-RS-PIT-to-self (1.B.1.a)**, which still resolves shards via `listShards` and needs the `replicaset` branch
-first.
+are never snapshotable, and must be excluded from data steps but counted for RS quorum). **Now unblocked:**
+RS-PIT-to-self (1.B.1.a) is validated (live on `aen-rs-01`, 2026-09-09) and the `replicaset` branch — which
+resolves the single RS instead of `listShards` — has shipped, so this extension can now be built on top of it.
 
 ### 4. DRY — share the per-node SSH steps with `restore.py`
 `restore_to_target.py` intentionally **replicates** `restore.py`'s certified remote-shell steps (stop

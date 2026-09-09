@@ -18,9 +18,10 @@ understand *why* it's crash-consistent? See [docs/how-it-works.md](docs/how-it-w
 
 These are one-time and usually provisioned by an admin. Confirm each before continuing:
 
-- [ ] **A MongoDB 8.0 sharded cluster *or* standalone replica set** managed by **Ops Manager 8.0**, with
-      `/data/mongo` on a **FlashArray** volume (a single direct pRDM is the validated layout; LVM-over-multipath
-      is supported but not yet live-validated) — every array enrolled in the same **Pure Storage Fusion fleet**.
+- [ ] **A MongoDB 8.0 sharded cluster *or* standalone replica set** managed by **Ops Manager 8.0**, with the
+      data mount (`MONGO_DATA_MOUNT`, default `/data/mongo`; the reference lab uses `/u01/data`) on **FlashArray**
+      volume(s) — both a single direct pRDM and multi-PV LVM-over-multipath are live-validated — every array
+      enrolled in the same **Pure Storage Fusion fleet**.
 - [ ] **Hard requirement: all volumes backing a single node must be on the *same* FlashArray.** FlashArray
       snapshots are crash-consistent only *per array*, so a node whose data volumes span two arrays can't be
       snapshotted consistently. A single-volume (pRDM) node meets this automatically; for an LVM node, keep
@@ -47,13 +48,15 @@ files for PITR): `ssh <SSH_USER>@<node> id` should list `mongod`. If not: `sudo 
 
 ## Sudo access on the cluster nodes (restore only)
 
-Only **`restore-mongo-snapshot`** touches the OS as root — it stops the agents, unmounts `/data/mongo`,
-rescans the LUN, and remounts. **`new-mongo-snapshot`, `start`/`stop-oplog-tailer`, `invoke-oplog-replay`, and
-`initialize-protection-groups` use no sudo at all** — they run as `SSH_USER` (the tailer only needs the
-`mongod` group, above, to read oplog files).
+Only **`restore-mongo-snapshot`** touches the OS as root — it stops the agents, unmounts the configured data
+mount, rescans the LUN, and remounts. **`new-mongo-snapshot`, `preflight-mongo-backup`,
+`start`/`stop-oplog-tailer`, `invoke-oplog-replay`, and `initialize-protection-groups` use no sudo at all** —
+they run as `SSH_USER` (the tailer only needs the `mongod` group, above, to read oplog files).
 
 The prerequisites assume `SSH_USER` has passwordless `sudo`. If you'd rather not grant blanket
-`NOPASSWD: ALL`, scope it to exactly what restore invokes over SSH on each node:
+`NOPASSWD: ALL`, scope it to exactly what restore invokes over SSH on each node. The examples below use the
+reference lab's mount `/u01/data`; **substitute your `MONGO_DATA_MOUNT`** (the fixed `mount`/`umount` arguments
+must match the actual path exactly, or sudo falls through to a password prompt):
 
 ```text
 systemctl stop  mongodb-mms-automation-agent      # STEP 1  quiesce OM's agent
@@ -62,9 +65,9 @@ pkill -TERM -x mongod                             # STEP 2  stop mongod/mongos (
 pkill -TERM -x mongos
 pkill -KILL -x mongod
 pkill -KILL -x mongos
-umount /data/mongo                                # STEP 3  unmount before the volume overwrite
-lsof  +f -- /data/mongo                           #   (only on an unmount failure — diagnostic)
-fuser -mv /data/mongo                             #   (only on an unmount failure — diagnostic)
+umount /u01/data                                  # STEP 3  unmount before the volume overwrite
+lsof  +f -- /u01/data                             #   (only on an unmount failure — diagnostic)
+fuser -mv /u01/data                               #   (only on an unmount failure — diagnostic)
 tee /sys/block/<disk>/device/rescan               # STEP 5  rescan the re-pointed LUN
 blockdev --rereadpt /dev/<disk>                   #   (partprobe is the fallback)
 partprobe /dev/<disk>
@@ -74,7 +77,7 @@ vgchange -ay                                      #   LVM: no-op on a single pRD
 blkid -s TYPE -o value /dev/<part>                #   detect fs type for the RO integrity check
 xfs_repair -n /dev/<part>                         #   RO integrity check (xfs) ...
 e2fsck   -n -f /dev/<part>                         #   ... or ext2/3/4
-mount /data/mongo                                 # STEP 5  remount from fstab
+mount /u01/data                                   # STEP 5  remount from fstab
 ```
 
 ### Example scoped `sudoers`
@@ -90,8 +93,8 @@ Cmnd_Alias MONGO_RESTORE = \
     /usr/bin/systemctl start mongodb-mms-automation-agent, \
     /usr/bin/pkill -TERM -x mongod, /usr/bin/pkill -KILL -x mongod, \
     /usr/bin/pkill -TERM -x mongos, /usr/bin/pkill -KILL -x mongos, \
-    /usr/bin/umount /data/mongo, /usr/bin/mount /data/mongo, \
-    /usr/bin/lsof +f -- /data/mongo, /usr/bin/fuser -mv /data/mongo, \
+    /usr/bin/umount /u01/data, /usr/bin/mount /u01/data, \
+    /usr/bin/lsof +f -- /u01/data, /usr/bin/fuser -mv /u01/data, \
     /usr/bin/tee /sys/block/*/device/rescan, \
     /usr/sbin/blockdev --rereadpt /dev/*, /usr/sbin/partprobe /dev/*, \
     /usr/bin/udevadm settle --timeout=15, \
@@ -145,7 +148,7 @@ Fill in (the tool finds `.env` via `$MONGO_FA_BACKUP_ENV`, else python-dotenv's 
 | `FA_USERNAME` + `FA_PASSWORD` | Directory login that authorizes fleet-wide *(preferred)*. **Or** set `FA_APITOKEN` for single-array use. |
 | `FA_API_VERSION` | FlashArray REST API version (e.g. `2.51`). |
 | `TOPOLOGY` | `sharded` (default) or `replicaset` — see the multi-deployment note below. |
-| `FA_PROTECTION_GROUP` | Protection group name; convention `<cluster-name>-pg` (e.g. `aen-cluster-pg`). |
+| `FA_PROTECTION_GROUP` | Protection group name; convention `<cluster-name>-pg` (e.g. `aen-prod-pg`). |
 | `FA_CLUSTER_NAME` | Logical name for your cluster (used in tags/labels). |
 | `OM_BASE_URL` | Ops Manager URL, e.g. `http://opsmgr.example.com:8080`. |
 | `OM_API_VERSION` | OM public API version (e.g. `v1.0`). |
@@ -156,6 +159,8 @@ Fill in (the tool finds `.env` via `$MONGO_FA_BACKUP_ENV`, else python-dotenv's 
 | `MONGOS_HOST` / `MONGOS_PORT` | **Sharded:** a `mongos` router (e.g. `aen-mongo-01` / `27017`). **Replica set:** any RS member (counts/probes run there). |
 | `SSH_USER` | The SSH user with passwordless sudo on every node. |
 | `MONGO_TOOLS_BASE` | Path to the MongoDB Database Tools (`mongodump`/`mongorestore`/decoder) on the nodes. |
+| `MONGO_DATA_MOUNT` *(optional)* | The data mount restore unmounts/remounts. Default `/data/mongo`; the reference lab uses `/u01/data`. Per-deployment. |
+| `OM_HTTP_TIMEOUT_SEC` *(optional)* | Ops Manager REST timeout. Default `120` — raise for dense clusters whose OM calls exceed 30s. |
 | `CLUSTER_NODES` *(optional)* | Comma-separated node hostnames — a fallback used only if Ops Manager is unreachable. `initialize-protection-groups` refreshes it from OM on each run. |
 
 > Keep `.env` out of git (it holds secrets) — it's already in `.gitignore`.
@@ -166,16 +171,18 @@ underscores) and selected with `--deployment <name>` on any command (omit for th
 `TOPOLOGY=replicaset` for a standalone replica set (no `mongos`; point `MONGOS_HOST` at any RS member). Example:
 
 ```
-# default (flat) deployment = sharded
+# default (flat) deployment = sharded (aen-prod)
 TOPOLOGY=sharded
-FA_PROTECTION_GROUP=aen-cluster-pg
+FA_PROTECTION_GROUP=aen-prod-pg
 OM_CLUSTER_ID=<sharded-cluster-id>
 MONGOS_HOST=aen-mongo-01
-# second deployment, used with: --deployment aen-rs-00
-AEN_RS_00__TOPOLOGY=replicaset
-AEN_RS_00__FA_PROTECTION_GROUP=aen-rs-00-pg
-AEN_RS_00__OM_CLUSTER_ID=<rs-cluster-id>
-AEN_RS_00__MONGOS_HOST=aen-mongo-05.example.com
+MONGO_DATA_MOUNT=/u01/data
+# second deployment, used with: --deployment aen-rs-01
+AEN_RS_01__TOPOLOGY=replicaset
+AEN_RS_01__FA_PROTECTION_GROUP=aen-rs-01-pg
+AEN_RS_01__OM_CLUSTER_ID=<rs-cluster-id>
+AEN_RS_01__MONGOS_HOST=aen-mongo-05.example.com
+AEN_RS_01__MONGO_DATA_MOUNT=/u01/data
 ```
 See [.env.example](.env.example) for the full template. Append `--deployment <name>` to **every** command below
 when working a non-default deployment.
@@ -215,6 +222,16 @@ changes (a node or array added/removed); it's idempotent. Use `--prune` to drop 
 
 ## 5. Take a snapshot
 
+First, run the read-only readiness gate — it checks third-party registration, in-flight jobs, snapshotable
+verdicts, `preferredOplogNodes`, FCV skew, agent health, a symlink-escape guard under the data mount, and PG
+membership, exiting non-zero on any failure:
+
+```bash
+preflight-mongo-backup            # add --deployment <name> for a non-default deployment
+```
+
+Once it passes, take the snapshot:
+
 ```bash
 new-mongo-snapshot
 ```
@@ -243,7 +260,7 @@ restore-mongo-snapshot --snapshot-tag om-20260512-143022 --force
 ```
 
 What happens: STEP 0 validates the snapshot is restorable (present on every array, every member, size match)
-→ stops agents/mongod → unmounts `/data/mongo` → overwrites each FA volume from the snapshot (sub-second CoW
+→ stops agents/mongod → unmounts the data mount → overwrites each FA volume from the snapshot (sub-second CoW
 swap) → remounts → restarts agents (WiredTiger crash-recovers) → waits for the cluster to stabilize → verifies
 document counts. For a **sharded** cluster it also connects to each shard's RS and confirms the shards
 physically hold the data (per-shard totals account for the mongos aggregate); a replica set verifies directly.
@@ -258,7 +275,7 @@ Success looks like this at the end of the run:
 … mongos up, N shards registered, N primaries reachable   (sharded)
 … replica set up, primary elected: <host>                 (replica set)
 Baseline OK : testdb.loadtest = 39600 in [39600, 39600] (drift=0)
-  aen-shard_1: testdb.loadtest=26339 …                    (per-shard, sharded only)
+  prod-shard_01: testdb.loadtest=26339 …                  (per-shard, sharded only)
 === Restore Complete ===
 ```
 
@@ -288,8 +305,11 @@ restore-mongo-snapshot --snapshot-tag om-20260512-143022 --force
 invoke-oplog-replay --snapshot-tag om-20260512-143022 --target-timestamp 0   # 0 = replay everything captured
 ```
 
-Replay to a specific point by passing a Unix timestamp instead of `0`. `invoke-oplog-replay` refuses if it sees
-oplog gap markers (`gap-*.json`); add `--allow-gaps` to override (coverage inside a gap is unrecoverable).
+Replay to a specific point by passing a Unix timestamp instead of `0`. To confirm the captured stream actually
+reaches your intended PIT target **before** the destructive overwrite, add `--pitr-target <ts|0>` to the
+`restore-mongo-snapshot` step. `invoke-oplog-replay` refuses if it sees oplog gap markers (`gap-*.json`; add
+`--allow-gaps` to override — coverage inside a gap is unrecoverable) or a target below the snapshot's on-disk
+`mongo:floor` (add `--allow-floor-override` to force it — unsafe); `--replay-timeout-sec` bounds the replay.
 Success prints `unrecoveredTail=0`. Stream state lives under `~/mongo-oplog-stream/<tag>/`.
 
 ---

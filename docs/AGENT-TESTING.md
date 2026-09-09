@@ -37,8 +37,9 @@ reports pass/fail with evidence.
 
 **Run the full documented test suite (Tests 1–8):**
 ```
-Run all the tests in tests-docs/Test-SnapshotRestore.md end-to-end, both deployments. Do the environment
-gate first (OM reachable + both clusters healthy). For each test report PASS/FAIL with the concrete evidence
+Run all the tests in tests-docs/Test-SnapshotRestore.md end-to-end, both deployments (aen-prod and
+aen-rs-01). Do the environment gate first: run preflight-mongo-backup --deployment <name> for each and
+confirm OM reachable + both clusters healthy. For each test report PASS/FAIL with the concrete evidence
 (counts, drift, unrecoveredTail, sentinel/marker state). Record the results and commit.
 ```
 
@@ -50,14 +51,14 @@ results in tests-docs/ and commit. Skip out-of-scope items (incremental, restore
 
 **One targeted flow (example — RS PITR):**
 ```
-Live-verify a full PITR cycle on aen-rs-00: snapshot(T1) → insert a post-snapshot marker → restore→T1 →
-replay→T2. Confirm the tailer and cursor target the primary, and that the marker is absent at T1 and present
-at T2 with unrecoveredTail=0.
+Live-verify a full PITR cycle on aen-rs-01: preflight-mongo-backup --deployment aen-rs-01, then
+snapshot(T1) → insert a post-snapshot marker → restore→T1 → replay→T2. Confirm the tailer and cursor target
+the primary, and that the marker is absent at T1 and present at T2 with unrecoveredTail=0.
 ```
 
 **Single self-restore fidelity check (fastest smoke test):**
 ```
-Run demo/rs-restore-demo.sh against aen-rs-00 and report the result. (Non-PITR RS self-restore: mutate →
+Run demo/rs-restore-demo.sh against aen-rs-01 and report the result. (Non-PITR RS self-restore: mutate →
 restore → sentinel gone, drift 0.)
 ```
 
@@ -86,6 +87,11 @@ map onto these plus failover (3.a/b/c), verification (4.a–e), and edge-topolog
 conversion, arbiter). The four core in-scope items are **1.A.1.a** (RS self-restore), **1.B.1.a** (RS PIT),
 **2.A.a** (sharded self-restore), **2.B.e** (sharded PIT).
 
+> **Both deployments are currently validated (2026-09-09):** `preflight-mongo-backup` 9/9 PASS on each, and a
+> full snapshot → restore (`--pitr-target 0`) → replay PITR cycle with A/B markers passed with `drift 0` at T1
+> and `unrecoveredTail=0` at T2 on **`aen-prod`** (tag `om-20260909-180000`) and **`aen-rs-01`** (tag
+> `om-20260909-190000`). Multi-PV LVM restore validated live.
+
 ---
 
 ## 4. Operational knowledge the agent must have
@@ -93,9 +99,15 @@ conversion, arbiter). The four core in-scope items are **1.A.1.a** (RS self-rest
 These are the things that make a run succeed or fail — learned the hard way (see [LESSONS.md](LESSONS.md)). An
 agent that knows them up front avoids the dead ends.
 
-1. **Always pass `--deployment <name>`** on multi-deployment installs. Omitting it silently targets the *other*
-   (default/sharded) deployment — the #1 footgun. It makes `stop-oplog-tailer`/`invoke-oplog-replay` read the
-   wrong T2 mark or replay against the wrong cluster.
+0. **Run `preflight-mongo-backup --deployment <name>` FIRST** (before any snapshot/restore). It's a read-only
+   readiness gate — third-party registration/oplogType, in-flight jobs, snapshotable verdicts, stale
+   `preferredOplogNodes`, FCV skew, agent health, a symlink-escape guard under the data mount, and PG
+   membership — and exits 1 on any FAIL. Both deployments currently pass **9/9**; clear any FAIL before
+   proceeding rather than pushing into a snapshot.
+1. **Always pass `--deployment <name>`** on multi-deployment installs (`aen-prod` for the sharded cluster,
+   `aen-rs-01` for the replica set). Omitting it silently targets the *default/sharded* `aen-prod` deployment —
+   the #1 footgun. It makes `stop-oplog-tailer`/`invoke-oplog-replay` read the wrong T2 mark or replay against
+   the wrong cluster.
 2. **Snapshot tags must match `^om-\d{8}-\d{6}$`** (e.g. `om-20260724-120000`) — no suffixes. The tailer and the
    snapshot must share the tag for replay to find both the FA snapshot and the oplog stream.
 3. **Connect correctly:** sharded → `mongosh mongodb://<mongos-host>:27017` (a mongos, `isdbgrid`); RS → run
@@ -121,6 +133,20 @@ agent that knows them up front avoids the dead ends.
    state). If it can't confirm the balancer stopped it fails loud — fix mongos reachability or pass
    `--skip-balancer-stop` (unsafe) to override.
 10. **`SSH_USER` must be in `mongod`** on every node (incl. newly added ones) or the tailer `scp` fails silently.
+11. **PITR floor guard.** Snapshots write a `mongo:floor` tag (per-cluster on-disk PITR floor).
+    `invoke-oplog-replay` **refuses a target below the floor** and validates every shard's `(T1, target]`
+    window (contiguity + reaches target) before replaying **any** shard (all-or-nothing). Use
+    `--allow-floor-override` (unsafe) only deliberately; `--allow-gaps` and `--replay-timeout-sec` are the other
+    new knobs.
+12. **`restore-mongo-snapshot --pitr-target <ts|0>` gates the overwrite.** It verifies the captured oplog stream
+    reaches the PIT target **before** touching any volume — pass `0` for a snapshot-only restore with no replay.
+    Sharded restore STEP 7.5 restores the balancer from the `mongo:balancer` tag.
+13. **Transient "no snapshotable member" → `--snapshotable-wait <sec>`.** `new-mongo-snapshot` auto-`/finish`es a
+    READY in-flight job (refuses a PENDING one) and records pre-quiesce balancer state in `mongo:balancer`;
+    a bounded `--snapshotable-wait` rides out a transient verdict instead of failing immediately.
+14. **`.env` tunables that bit dense clusters:** `MONGO_DATA_MOUNT` sets the data mount per deployment (default
+    `/data/mongo`; this lab uses `/u01/data`), and `OM_HTTP_TIMEOUT_SEC` (default 120) — dense clusters exceed
+    the old 30s OM HTTP timeout.
 
 ---
 

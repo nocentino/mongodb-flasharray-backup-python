@@ -59,7 +59,7 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-This installs the dependencies (`python-dotenv`, `requests`, `typer`) and the eleven console scripts listed below.
+This installs the dependencies (`python-dotenv`, `requests`, `typer`) and the twelve console scripts listed below.
 
 > **SSH multiplexing.** All remote commands shell out to the system `ssh`/`scp` with ControlMaster options
 > (`ControlPath=/tmp/ssh-mux-%C`, `ControlPersist=60s`) to avoid saturating `sshd`'s `MaxStartups`. No Python
@@ -82,8 +82,9 @@ FlashArray authentication (`fa_rest.py`) supports two modes:
 Keys: `FA_ENDPOINT`, `FA_USERNAME`, `FA_API_VERSION`, `FA_PROTECTION_GROUP`, `FA_CLUSTER_NAME`, plus
 `FA_PASSWORD` and/or `FA_APITOKEN`; `OM_BASE_URL`, `OM_API_VERSION`, `OM_GROUP_ID`, `OM_CLUSTER_ID`,
 `OM_PUBLIC_KEY`, `OM_PRIVATE_KEY`; `MONGOSH_PATH`, `MONGOS_HOST`, `MONGOS_PORT`, `SSH_USER`,
-`MONGO_TOOLS_BASE`; and optional `CLUSTER_NODES` (comma-separated fallback used only when Ops Manager is
-unreachable).
+`MONGO_TOOLS_BASE`; optional `MONGO_DATA_MOUNT` (per-deployment data mount, default `/data/mongo`),
+`OM_HTTP_TIMEOUT_SEC` (OM REST timeout, default `120` — dense clusters exceed 30s), and optional
+`CLUSTER_NODES` (comma-separated fallback used only when Ops Manager is unreachable).
 
 The `.env` is located via `$MONGO_FA_BACKUP_ENV`, else python-dotenv's search from the current directory, else
 `./.env`. A missing file or required key raises immediately.
@@ -100,11 +101,11 @@ flat keys are used as-is (backward compatible with a single-deployment `.env`).
 - **`TOPOLOGY`** is `sharded` (topology discovered/validated via `mongos`/`listShards`) or `replicaset` (a
   standalone replica set — no `mongos`; set `MONGOS_HOST` to **any RS member**, where document counts and the
   restore-stabilization probe run).
-- Protection groups follow a `<cluster-name>-pg` convention (e.g. `aen-cluster-pg`, `aen-rs-00-pg`).
+- Protection groups follow a `<cluster-name>-pg` convention (e.g. `aen-prod-pg`, `aen-rs-01-pg`).
 
 ```bash
 new-mongo-snapshot                          # default deployment (flat keys)
-new-mongo-snapshot --deployment aen-rs-00   # the AEN_RS_00__* deployment
+new-mongo-snapshot --deployment aen-rs-01   # the AEN_RS_01__* deployment
 ```
 
 See [.env.example](.env.example) for a worked two-deployment example.
@@ -120,9 +121,10 @@ See [.env.example](.env.example) for a worked two-deployment example.
   snapshots). The standard `backupConfigs statusName=STARTED` path is OM-managed backup and will 409
   `Could not find available Snapshot Store`.
 - Protection groups initialized on all FlashArrays (`initialize-protection-groups`, run per deployment).
-- A data volume per node mounted at `/data/mongo`. A single direct volume (pRDM) is the **live-validated**
-  layout; LVM-over-multipath (a VG spanning several FlashArray volumes) is **supported** by discovery, tagging
-  and restore but is not yet validated on live hardware.
+- A data volume per node mounted at the **configured data mount** — `MONGO_DATA_MOUNT` (default `/data/mongo`;
+  the reference lab uses `/u01/data`). The WiredTiger journal lives in-place inside the dbPath (not a separate
+  volume). Both a single direct volume (pRDM) and **multi-PV LVM-over-multipath** (a VG spanning several
+  FlashArray volumes) are **live-validated** for discovery, tagging, snapshot and restore.
 - **Hard requirement — a node's data volumes must all live on the *same* FlashArray.** FlashArray
   protection-group snapshots are atomic only **per array**; the per-array snapshots in one run fire
   independently, so a node whose volumes span two arrays cannot be captured crash-consistently (its LVM/VG
@@ -135,19 +137,20 @@ See [.env.example](.env.example) for a worked two-deployment example.
 
 Run `<command> --help` for full option details. The deployment-aware commands — `new-mongo-snapshot`,
 `restore-mongo-snapshot`, `restore-mongo-snapshot-to-target`, `initialize-protection-groups`,
-`start-oplog-tailer`, `stop-oplog-tailer`, and `invoke-oplog-replay` — accept **`--deployment <name>`** to select
-a deployment from the `.env` (omit for the default/flat deployment).
+`preflight-mongo-backup`, `start-oplog-tailer`, `stop-oplog-tailer`, and `invoke-oplog-replay` — accept
+**`--deployment <name>`** to select a deployment from the `.env` (omit for the default/flat deployment).
 
 | Command | Purpose |
 |---|---|
 | `initialize-protection-groups` | Create the PG on every fleet array and add data volumes. `--what-if`, `--prune`, `--force`. |
-| `new-mongo-snapshot` | Take a crash-consistent FlashArray PG snapshot across all nodes via the backup-cursor window. `--snapshot-tag`, `--baseline-database`, `--baseline-collections`. |
-| `restore-mongo-snapshot` | Destructive in-place restore from a snapshot tag. Verifies baseline counts; **sharded restores also verify per-shard data distribution** (each shard's RS counted directly, sums account for the mongos aggregate). `--snapshot-tag` (required), `--force`, `--verify-database`, `--skip-verification`. |
+| `preflight-mongo-backup` | Read-only readiness gate before a snapshot — third-party registration/oplogType, in-flight jobs, snapshotable verdicts, stale `preferredOplogNodes`, FCV skew, agent health, symlink-escape guard under the data mount, and PG membership. Exit 1 on any FAIL. |
+| `new-mongo-snapshot` | Take a crash-consistent FlashArray PG snapshot across all nodes via the backup-cursor window. For **sharded**, stops the balancer for the snapshot and restores its prior state; auto-`/finish`es a READY in-flight job. `--snapshot-tag`, `--baseline-database`, `--baseline-collections`, `--snapshotable-wait <sec>`, `--skip-balancer-stop` (unsafe). |
+| `restore-mongo-snapshot` | Destructive in-place restore from a snapshot tag. Verifies baseline counts; **sharded restores also verify per-shard data distribution** (each shard's RS counted directly, sums account for the mongos aggregate) and restore the balancer's pre-snapshot state. `--snapshot-tag` (required), `--force`, `--verify-database`, `--skip-verification`, `--pitr-target <ts\|0>` (verify the captured oplog stream reaches the PIT target before any overwrite). |
 | `restore-mongo-snapshot-to-target` | Cross-cluster restore of a replica-set snapshot to a **different** replica set (seed + initial-sync; seed's volume must be on the same array as the source snapshot). `--snapshot-tag` (required), `--target-nodes`, `--target-rs-name`, `--target-seed`, `--target-member-port`, `--deployment`, `--force`. |
 | `remove-old-artifacts` | Retention cleanup of old FA snapshots + local oplog/log dirs. `--older-than-days` (required, 1–365), `--what-if`. |
 | `start-oplog-tailer` | Continuously capture oplog `.oplogs` segments for PITR. `--snapshot-tag`, `--interval-sec`, `--timeout-minutes`, `--poll-interval-sec`, `--abort-on-gap`. |
 | `stop-oplog-tailer` | Stop the tailer (`.stop` sentinel) and capture the T2 mark. `--snapshot-tag`, `--wait-sec`, `--baseline-database`, `--baseline-collections`. |
-| `invoke-oplog-replay` | Replay oplog segments to a target timestamp after a restore. Refuses if oplog gap markers are present (`--allow-gaps` to override). `--snapshot-tag`, `--target-timestamp`, `--verify-database`, `--t2-mark-path`, `--skip-verification`, `--allow-gaps`. |
+| `invoke-oplog-replay` | Replay oplog segments to a target timestamp after a restore. Refuses a target below the snapshot's on-disk `mongo:floor`; validates every shard's `(T1, target]` window before replaying any shard (all-or-nothing). `--snapshot-tag`, `--target-timestamp`, `--verify-database`, `--t2-mark-path`, `--skip-verification`, `--allow-gaps`, `--allow-floor-override` (unsafe), `--replay-timeout-sec`. |
 | `initialize-test-data` | Seed `testdb.loadtest`/`payload` (hashed `_id` sharding). `--loadtest-docs`, `--payload-docs`, `--batch-size`, `--force`. |
 | `start-insert-load` | Continuous insert load generator. `--max-docs`, `--batch-size`. |
 | `run-all-tests` | 3-phase e2e suite (restore / restore-under-load / PITR). `--start-at-test`, `--stop-after-test`. |
@@ -188,7 +191,10 @@ invoke-oplog-replay --snapshot-tag om-20260512-143022 --target-timestamp 1747058
 ## Snapshot metadata
 
 Metadata is stored on the FlashArray PG-snapshot **tags**, with JSON string values: `mongo:volumes`,
-`mongo:preSnap`, `mongo:postSnap`, `mongo:t1ts` — these are the source of truth for restore and PITR. PITR
+`mongo:preSnap`, `mongo:postSnap`, `mongo:t1ts` (backup-cursor anchor), `mongo:floor` (per-cluster PITR
+on-disk floor — replay below it is refused), and `mongo:balancer` (the balancer's pre-quiesce state, restored
+on a sharded restore) — plus the copyable `mongo:` volume-map tags (`deployment`, `node`, `mountpoint`,
+`serial`, `vg`, `pvindex`, `pvcount`, `volumes`). These are the source of truth for restore and PITR. PITR
 stream state lives in JSON files under `~/mongo-oplog-stream/<tag>/` (`state.json`, `t2-mark.json`,
 `gap-*.json`) with `.stop`/`.started`/`.stopped` sentinels. Logs are teed to console and to
 `~/mongo-{snapshot,restore,oplogtailer,oplogreplay}-logs/`.

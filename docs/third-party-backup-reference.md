@@ -392,6 +392,10 @@ OM does not automatically start tailing another node. The client must select a n
 > [../tests-docs/Test-CertificationChecklist.md](../tests-docs/Test-CertificationChecklist.md)** (the raw MongoDB
 > checklist below, mapped to the tool with recorded results). Annotated here: ✅ validated · 🟡 supported, not yet
 > run · ❌ out of scope for this tool (in-place self-restore + full snapshots only).
+>
+> **Current standing lab:** `aen-prod` (sharded) + `aen-rs-01` (replica set); both re-validated 2026-09-09.
+> The `aen-rs-00` / `aen-cluster` names in the results below are **historical** — those results are accurate for
+> the lab as it was then; the lab has since been reshaped (see the current-environment / how-it-works docs).
 
 ### Replica Set Testing
 

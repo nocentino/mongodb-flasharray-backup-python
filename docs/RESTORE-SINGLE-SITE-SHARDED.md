@@ -64,10 +64,10 @@ For tag `om-YYYYMMDD-HHMMSS`, identify the FA protection-group snapshot member f
 
 | Role | Source member (example) | Restores onto |
 |---|---|---|
-| Config server (`aen-shard_0`) | `aen-mongo-config-00` volume | config host |
-| shard_1 | this site's `aen-shard_1` member | shard_1 host |
-| shard_2 | this site's `aen-shard_2` member | shard_2 host |
-| shard_3 | this site's `aen-shard_3` member | shard_3 host |
+| Config server (`prod-cfg`) | this site's `prod-cfg` member volume | config host |
+| shard_1 (`prod-shard_01`) | this site's `prod-shard_01` member | shard_1 host |
+| shard_2 (`prod-shard_02`) | this site's `prod-shard_02` member | shard_2 host |
+| shard_3 (`prod-shard_03`) | this site's `prod-shard_03` member | shard_3 host |
 
 That's **N shards + 1 config = the whole dataset**. (The shipped tool restores *all* members; scoping to one
 site's four volumes is currently a **manual FA volume overwrite** per volume, or a future `--nodes` flag.)
@@ -87,7 +87,8 @@ start `mongod`, then **force-reconfigure** the RS down to the surviving member s
 
 1. **Freeze automation.** Stop the OM automation agent on the target hosts (or put the project in a state that
    matches the reduced topology) so OM doesn't fight the manual reconfig. Stop `mongod`/`mongos` on the targets.
-2. **Restore the config-server volume** from its snapshot (CoW overwrite), remount `/data/mongo`.
+2. **Restore the config-server volume** from its snapshot (CoW overwrite), remount the data mount
+   (`MONGO_DATA_MOUNT`, `/u01/data` in this lab).
 3. **Bring up the config server**, then **force-reconfigure its RS to the surviving member(s)**:
    ```js
    // on the config-server member

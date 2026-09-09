@@ -2,6 +2,11 @@
 
 Running log of mistakes and the rules adopted to prevent recurrence (per the agent operating rules).
 
+> **Naming note:** the dated entries below reference the earlier deployment names `aen-cluster` (sharded) and
+> `aen-rs-00` (replica set), now **retired**. The current standing deployments are `aen-prod` (sharded) and
+> `aen-rs-01` (replica set). The entries are left verbatim as accurate history; the rules apply unchanged under
+> the current names.
+
 ## 2026-07-23 — Always pass `--deployment` on the PITR subcommands
 
 **Mistake:** During the primary-sourced PITR verification on `aen-rs-00`, I ran `stop-oplog-tailer` and

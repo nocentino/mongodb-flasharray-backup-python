@@ -19,9 +19,9 @@
 # destructive to the target replica set's `testdb`. Run only against a lab/test deployment.
 #
 # Usage:
-#   demo/rs-restore-demo.sh [--deployment aen-rs-00] [--tag om-YYYYMMDD-HHMMSS] [--yes]
+#   demo/rs-restore-demo.sh [--deployment aen-rs-01] [--tag om-YYYYMMDD-HHMMSS] [--yes]
 #
-#   --deployment   deployment name from .env (default: aen-rs-00; must be TOPOLOGY=replicaset)
+#   --deployment   deployment name from .env (default: aen-rs-01; must be TOPOLOGY=replicaset)
 #   --tag          snapshot tag (default: auto-generated om-<UTC timestamp>)
 #   --yes          skip the interactive confirmation before the destructive steps
 #
@@ -32,7 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-DEPLOYMENT="aen-rs-00"
+DEPLOYMENT="aen-rs-01"
 TAG=""
 ASSUME_YES=0
 while [[ $# -gt 0 ]]; do

@@ -22,12 +22,23 @@ implemented-and-unit-tested, blocked on a documented operator prerequisite, or o
 
 ## Environment
 
+Current standing lab (2026-09-09):
+
 | Deployment | Topology | Notes |
 |---|---|---|
-| `aen-cluster` (sharded) | dedicated config server + 3 shards (`aen-mongo-01/02/03`, `-config-00`) | 10 nodes, one OM project |
-| `aen-rs-00` (replica set) | 3 members (`aen-mongo-05/06/07`) | multi-deployment from one `.env` |
+| `aen-prod` (sharded) | 3 data shards (×3 members) + a dedicated 3-member config RS + 2 `mongos`, across `aen-mongo-01..04` | PG `aen-prod-pg` = 8 FlashArray volumes; `--deployment aen-prod` (default) |
+| `aen-rs-01` (replica set) | 3 members (`aen-mongo-05/06/07`) | PG `aen-rs-01-pg` = 6 volumes; multi-deployment from one `.env`, `--deployment aen-rs-01` |
 
-Each node's `/data/mongo` is a FlashArray volume in a Fusion fleet.
+Each node's data mount (`/u01/data` in this lab — configurable per deployment via `MONGO_DATA_MOUNT`, default
+`/data/mongo`) is an LVM volume group (`vg_database`) over FlashArray volumes in a Fusion fleet. Both deployments
+pass `preflight-mongo-backup` 9/9 and were re-validated end-to-end (snapshot → restore → PITR replay) on 2026-09-09.
+
+> **Scale-testing note:** a dense `aen-prod` build — **32 data shards (33 replica sets × 5 members, ~165 mongods)** —
+> was validated 2026-09-08 (tag `om-20260908-170000`) as a **customer-density scale test**, not the standing shape.
+> The lab was then reduced to the 3-shard `aen-prod` + 3-member `aen-rs-01` above and re-validated 2026-09-09.
+
+> The earlier deployment names `aen-cluster` (sharded) and `aen-rs-00` (RS) are retired; the dated result records and
+> runbook entries below that reference them remain accurate history for the lab as it was then.
 
 ## Results (in-scope, applicable items)
 

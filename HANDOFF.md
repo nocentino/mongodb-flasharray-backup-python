@@ -35,13 +35,16 @@ Adapt the names to your environment — nothing here is hard-coded except the *s
 
 | Component | Validated lab |
 |---|---|
-| **Sharded cluster** `aen-cluster` | Dedicated config server `aen-mongo-config-00` (`config`/`aen-shard_0`, :27019) + **3 data shards** `aen-shard_1/2/3` on `aen-mongo-01/02/03` (:27021/:27022/:27023); `mongos` on `aen-mongo-01:27017`. 10 mongod processes total. |
-| **Replica set** `aen-rs-00` | 3 members `aen-mongo-05/06/07` (:27017). |
-| **Spare node** | `aen-mongo-04` — no cluster role; used as the "extra node" for add-node / failover / gap tests. |
-| **Storage** | Each node's `/data/mongo` is **one FlashArray volume** (direct pRDM). Arrays in one **Fusion fleet**: e.g. `sn1-x90r2-f06-27`, `sn1-x90r2-f06-33`, `sn1-x90r2-f07-27`, `sn1-c60-e12-16`. |
-| **Protection groups** | One PG per cluster, named `<cluster>-pg`: `aen-cluster-pg`, `aen-rs-00-pg`. Each holds every node's data volume. |
+| **Sharded cluster** `aen-prod` (default deployment) | **3 data shards** `prod-shard_01/02/03` (each a 3-member replica set) + a dedicated **3-member config replica set** `prod-cfg` + **2 `mongos` routers**, laid out across **4 nodes** `aen-mongo-01..04` (each data node hosts members of several shards; config members on -01/-02/-03; `mongos` on `aen-mongo-01` and `aen-mongo-02`). |
+| **Replica set** `aen-rs-01` | 3 members on `aen-mongo-05/06/07` (:27017); dbPath `/u01/data/rs01`. |
+| **Storage** | Each node's data mount (`/u01/data`, configurable via `MONGO_DATA_MOUNT`) is an **LVM volume group** (`vg_database`) over **two 3T FlashArray volumes** (multi-PV) — a single direct pRDM is also supported. Arrays in one **Fusion fleet**: `sn1-x90r2-f07-27`, `sn1-x90r2-f06-27`, `sn1-x90r2-f06-33`, `sn1-c60-e12-16`. |
+| **Protection groups** | One PG per cluster, named `<cluster>-pg`: `aen-prod-pg` (**8 volumes** — 4 nodes × 2) and `aen-rs-01-pg` (**6 volumes** — 3 nodes × 2). Each holds every node's data volume(s). |
 | **Ops Manager** | OM 8.0, one project (group). Both clusters registered for **third-party backup** (`ACTIVE`). |
 | **Control machine** | A workstation/VM with Python 3.11+, the OpenSSH client, and SSH key access to every node. This is where the console commands run. |
+
+> A dense **32-data-shard** build of `aen-prod` (33 replica sets × 5 members, ~165 mongods) was validated as a
+> **customer-density scale test** (2026-09-08) — it is not the standing shape. The lab was reduced to the
+> 3-shard `aen-prod` + 3-member `aen-rs-01` above and re-validated 2026-09-09.
 
 Both deployments live in **one `.env`** (shared infra + `<NAME>__` per-deployment overrides), selected at runtime
 with `--deployment <name>`.
@@ -56,8 +59,11 @@ Every MongoDB node VM must satisfy:
       decode) and **`libsnappy.so`** installed (comes in as a dependency of the OM automation agent RPM; verify
       `rpm -q snappy`).
 - [ ] **MongoDB 8.0**, managed by the **Ops Manager automation agent** (`mongodb-mms-automation-agent`).
-- [ ] **`/data/mongo` on a FlashArray volume.** A **single direct pRDM** is the validated layout. LVM-over-multipath
-      is supported in code but **not yet live-validated** — if you use it, see the hard requirement below.
+- [ ] **Data mount on FlashArray volume(s).** The mount path is `MONGO_DATA_MOUNT` (default `/data/mongo`; the
+      reference lab uses `/u01/data`), with dbPaths under it (e.g. `/u01/data/shard01`, `/u01/data/cfg`,
+      `/u01/data/rs01`) and the WiredTiger journal in-place inside dbPath. Both a **single direct pRDM** and
+      **multi-PV LVM-over-multipath** (a VG spanning several FlashArray volumes) are live-validated — if you use
+      LVM, see the hard requirement below.
 - [ ] **HARD REQUIREMENT — one array per node.** All volumes backing a single node must be on the **same**
       FlashArray. FA snapshots are crash-consistent only *per array*; a node whose data spans two arrays cannot be
       snapshotted consistently. Single-volume nodes satisfy this automatically; for LVM, keep every PV of the VG on
@@ -67,11 +73,11 @@ Every MongoDB node VM must satisfy:
 - [ ] **SSH user (`SSH_USER`) in the `mongod` group** on **every** node — including any node added later — so the
       PITR tailer can `scp` the agent-written `640 mongod:mongod` `.oplogs` files. `ssh <SSH_USER>@<node> id`
       must list `mongod`; if not, `sudo usermod -aG mongod <SSH_USER>`.
-- [ ] **Firewall:** each mongod/mongos port reachable cluster-wide (`27017`, and shard ports `27021–27023`,
-      config `27019`). A member added on a new port needs that port opened
+- [ ] **Firewall:** each mongod/mongos port reachable cluster-wide (the `mongos` routers on `27017`, plus every
+      shard and config-server member port your layout uses). A member added on a new port needs that port opened
       (`firewall-cmd --add-port=<p>/tcp --permanent && firewall-cmd --reload`).
 - [ ] **Passwordless `sudo` for `SSH_USER`** — **only `restore` needs it** (it stops agents, unmounts
-      `/data/mongo`, rescans the LUN, remounts). Snapshot / PITR / init-pg use no sudo. Grant blanket
+      the data mount, rescans the LUN, remounts). Snapshot / PITR / init-pg / preflight use no sudo. Grant blanket
       `NOPASSWD: ALL` or the scoped `Cmnd_Alias` in
       [GETTING-STARTED.md → Sudo access](GETTING-STARTED.md#sudo-access-on-the-cluster-nodes-restore-only).
 
@@ -126,7 +132,8 @@ Installed as console scripts (`pip install -e .`). All accept `--deployment <nam
 | Command | Purpose | Sudo on nodes? |
 |---|---|---|
 | `initialize-protection-groups` | Create/maintain the FA PG + write `mongo:` volume-map tags. Run after any topology change. | no |
-| `new-mongo-snapshot` | Take a crash-consistent snapshot (opens `$backupCursor` on the primary; **stops the balancer** for sharded). | no |
+| `preflight-mongo-backup` | Read-only readiness gate (registration/oplogType, in-flight jobs, snapshotable verdicts, `preferredOplogNodes`, FCV skew, agent health, symlink-escape guard, PG membership). Exit 1 on any FAIL. | no |
+| `new-mongo-snapshot` | Take a crash-consistent snapshot (opens `$backupCursor` on the primary; **stops the balancer** for sharded and restores its prior state). `--snapshotable-wait`, `--skip-balancer-stop`. | no |
 | `restore-mongo-snapshot` | In-place self-restore (CoW overwrite → WT recovery → cluster re-forms). | **yes** |
 | `restore-mongo-snapshot-to-target` | RS → *different* RS restore (seed + initial-sync). Cert 1.A.1.b; not live-validated. | yes (more) |
 | `start-oplog-tailer` / `stop-oplog-tailer` | Continuous oplog capture for PITR / stop + write the T2 mark. | no |
@@ -163,6 +170,7 @@ You're up and running when all of these pass:
 - [ ] `.env` filled; `ssh <SSH_USER>@<each-node> sudo -n true` succeeds; `id` lists `mongod`.
 - [ ] OM reachable and both clusters report third-party backup **`ACTIVE`**; FA gateway reachable.
 - [ ] `initialize-protection-groups --deployment <name>` succeeds and the PG lists every node's volume.
+- [ ] `preflight-mongo-backup --deployment <name>` reports all checks **PASS** (exit 0).
 - [ ] A **snapshot → mutate → restore** cycle passes with **drift 0** and the sentinel gone
       (Test 4 sharded / Test 6 RS — or just run `demo/rs-restore-demo.sh`).
 - [ ] A **PITR cycle** (`start-oplog-tailer` → snapshot → writes → drain → stop → restore → replay) reaches

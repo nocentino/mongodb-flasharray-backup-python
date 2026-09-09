@@ -21,15 +21,15 @@ The sentinel is the point: a restore that merely matched on counts (a no-op) wou
 point-in-time revert removes it.
 
 ```bash
-# default: deployment aen-rs-00, auto-generated tag, interactive confirmation
-demo/rs-restore-demo.sh
+# current lab RS deployment (aen-rs-01), auto-generated tag, interactive confirmation
+demo/rs-restore-demo.sh --deployment aen-rs-01
 
 # non-interactive, explicit deployment/tag
-demo/rs-restore-demo.sh --deployment aen-rs-00 --tag om-20260724-120000 --yes
+demo/rs-restore-demo.sh --deployment aen-rs-01 --tag om-20260724-120000 --yes
 ```
 
-Flags: `--deployment <name>` (must be `TOPOLOGY=replicaset`), `--tag om-YYYYMMDD-HHMMSS`, `--yes` (skip the
-destructive-action confirmation), `--help`.
+Flags: `--deployment <name>` (must be `TOPOLOGY=replicaset`; the current lab RS deployment is `aen-rs-01`),
+`--tag om-YYYYMMDD-HHMMSS`, `--yes` (skip the destructive-action confirmation), `--help`.
 
 Exit code `0` = PASS (drift 0 + sentinel gone), `1` = FAIL (sentinel survived → volumes not truly reverted).
 
